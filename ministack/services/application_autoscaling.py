@@ -1,22 +1,29 @@
 # Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
-Application Auto Scaling Emulator (control plane).
+Application Auto Scaling Emulator (control plane, ECS services only).
 JSON 1.1 protocol via X-Amz-Target AnyScaleFrontendService.<Action>, signed as
 application-autoscaling.
 
 Supports:
   Scalable targets:  RegisterScalableTarget, DescribeScalableTargets, DeregisterScalableTarget
   Scaling policies:  PutScalingPolicy, DescribeScalingPolicies, DeleteScalingPolicy
+                     (StepScaling and TargetTrackingScaling)
   Scheduled actions: PutScheduledAction, DescribeScheduledActions, DeleteScheduledAction
   Tags:              TagResource, UntagResource, ListTagsForResource
 
-Targets, policies and scheduled actions are stored as given; nothing evaluates
-metrics or changes capacity.
+Only the ``ecs`` namespace (``ecs:service:DesiredCount`` on
+``service/<cluster>/<service>``) is accepted for writes. Targets, policies and
+scheduled actions are stored as given: nothing evaluates metrics, no CloudWatch
+alarms are created for target-tracking policies, and the ECS service's desired
+count is never changed. The ECS service named by ResourceId is not required to
+exist in MiniStack.
 """
 
 import copy
 import json
+import logging
+import re
 import time
 
 from ministack.core.responses import (
@@ -28,15 +35,35 @@ from ministack.core.responses import (
     new_uuid,
 )
 
+logger = logging.getLogger("application-autoscaling")
+
+_JSON_1_1 = "application/x-amz-json-1.1"
+
 _targets = AccountRegionScopedDict()     # "namespace|resource|dimension" -> scalable target
 _policies = AccountRegionScopedDict()    # "namespace|resource|dimension|name" -> scaling policy
 _scheduled = AccountRegionScopedDict()   # "namespace|resource|dimension|name" -> scheduled action
 _tags = AccountRegionScopedDict()        # scalable target ARN -> {key: value}
 
-_NAMESPACES = ("ecs", "elasticmapreduce", "ec2", "appstream", "dynamodb", "rds", "sagemaker",
-               "custom-resource", "comprehend", "lambda", "cassandra", "kafka", "elasticache",
-               "neptune", "workspaces")
-_POLICY_TYPES = ("StepScaling", "TargetTrackingScaling", "PredictiveScaling")
+# The ServiceNamespace enum from the botocore model; any other value fails the
+# model's enum constraint.
+_MODEL_NAMESPACES = ("ecs", "elasticmapreduce", "ec2", "appstream", "dynamodb", "rds", "sagemaker",
+                     "custom-resource", "comprehend", "lambda", "cassandra", "kafka", "elasticache",
+                     "neptune", "workspaces")
+# MiniStack choice: only ECS services can be registered.
+_SUPPORTED_NAMESPACES = ("ecs",)
+_ECS_DIMENSION = "ecs:service:DesiredCount"
+_ECS_RESOURCE_RE = re.compile(r"^service/[^/]+/[^/]+$")
+# AWS docs (Application Auto Scaling User Guide, service-linked roles): the
+# role Application Auto Scaling uses for ECS services when no RoleARN is given.
+_ECS_SERVICE_LINKED_ROLE = ("role/aws-service-role/ecs.application-autoscaling.amazonaws.com/"
+                            "AWSServiceRoleForApplicationAutoScaling_ECSService")
+_POLICY_CONFIG = {
+    "StepScaling": "StepScalingPolicyConfiguration",
+    "TargetTrackingScaling": "TargetTrackingScalingPolicyConfiguration",
+}
+_MODEL_POLICY_TYPES = ("StepScaling", "TargetTrackingScaling", "PredictiveScaling")
+_SCHEDULED_FIELDS = ("Schedule", "Timezone", "StartTime", "EndTime", "ScalableTargetAction")
+_MAX_RESULTS = 50
 
 
 def reset():
@@ -69,38 +96,102 @@ def load_persisted_state(data):
 # ---------------------------------------------------------------------------
 
 
+class _Invalid(Exception):
+    """A request that fails validation; carries the error response."""
+
+    def __init__(self, response):
+        super().__init__()
+        self.response = response
+
+
+def _error(code, message, extra=None):
+    # botocore: every modeled exception of this service declares "Message".
+    return error_response_json(code, message, 400, extra, message_key="Message", content_type=_JSON_1_1)
+
+
+def _ok(payload):
+    return json_response(payload, content_type=_JSON_1_1)
+
+
 def _validation(message):
-    return error_response_json("ValidationException", message, 400)
+    return _error("ValidationException", message)
 
 
 def _not_found(message):
-    return error_response_json("ObjectNotFoundException", message, 400)
+    return _error("ObjectNotFoundException", message)
+
+
+def _null_error(name):
+    member = name[0].lower() + name[1:]
+    return _validation(f"1 validation error detected: Value null at '{member}' "
+                       "failed to satisfy constraint: Member must not be null")
+
+
+def _check_namespace(data):
+    namespace = data.get("ServiceNamespace")
+    if not namespace:
+        raise _Invalid(_null_error("ServiceNamespace"))
+    if namespace not in _MODEL_NAMESPACES:
+        raise _Invalid(_validation(
+            f"1 validation error detected: Value '{namespace}' at 'serviceNamespace' failed to satisfy "
+            f"constraint: Member must satisfy enum value set: [{', '.join(_MODEL_NAMESPACES)}]"))
+    return namespace
+
+
+def _check_target_identity(data, *extra_required):
+    """Validate the namespace / resource / dimension triple of a write call."""
+    namespace = _check_namespace(data)
+    for name in ("ResourceId", "ScalableDimension") + extra_required:
+        if not data.get(name):
+            raise _Invalid(_null_error(name))
+    if namespace not in _SUPPORTED_NAMESPACES:
+        raise _Invalid(_validation(
+            f"MiniStack supports only the ecs service namespace for Application Auto Scaling, not {namespace}"))
+    if data["ScalableDimension"] != _ECS_DIMENSION or not _ECS_RESOURCE_RE.match(data["ResourceId"]):
+        raise _Invalid(_validation("Unsupported service namespace, resource type or scalable dimension"))
+
+
+def _capacity(data, name):
+    value = data.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _Invalid(_validation(f"{name} must be an integer"))
+    if value < 0:
+        raise _Invalid(_validation(f"{name} must be greater than or equal to 0"))
+    return value
 
 
 def _target_key(data):
-    return f"{data.get('ServiceNamespace')}|{data.get('ResourceId')}|{data.get('ScalableDimension')}"
+    return f"{data['ServiceNamespace']}|{data['ResourceId']}|{data['ScalableDimension']}"
 
 
-def _require(data, *names):
-    for name in names:
-        if not data.get(name):
-            return _validation(f"1 validation error detected: Value null at '{name[0].lower() + name[1:]}' "
-                               "failed to satisfy constraint: Member must not be null")
-    if data.get("ServiceNamespace") and data["ServiceNamespace"] not in _NAMESPACES:
-        return _validation(f"Unsupported service namespace: {data['ServiceNamespace']}")
-    return None
+def _public(record):
+    return {k: v for k, v in record.items() if not k.startswith("_")}
 
 
-def _id():
-    return new_uuid()
-
-
-def _arn(kind, ident):
-    return f"arn:aws:application-autoscaling:{get_region()}:{get_account_id()}:{kind}/{ident}"
+def _paginate(items, data, key):
+    """Offset-token pagination shared by the three Describe operations."""
+    max_results = data.get("MaxResults")
+    if max_results is None:
+        max_results = _MAX_RESULTS
+    elif isinstance(max_results, bool) or not isinstance(max_results, int) or not 1 <= max_results <= _MAX_RESULTS:
+        raise _Invalid(_validation(f"MaxResults must be between 1 and {_MAX_RESULTS}"))
+    token = data.get("NextToken")
+    start = 0
+    if token is not None:
+        if not isinstance(token, str) or not token.isdigit() or int(token) > len(items):
+            raise _Invalid(_error("InvalidNextTokenException", "Invalid token"))
+        start = int(token)
+    page = items[start:start + max_results]
+    result = {key: [_public(i) for i in page]}
+    if start + max_results < len(items):
+        result["NextToken"] = str(start + max_results)
+    return _ok(result)
 
 
 def _matches(item, data, list_key, name_key):
-    if item["ServiceNamespace"] != data.get("ServiceNamespace"):
+    if item["ServiceNamespace"] != data["ServiceNamespace"]:
         return False
     if data.get("ResourceId") and item["ResourceId"] != data["ResourceId"]:
         return False
@@ -110,86 +201,95 @@ def _matches(item, data, list_key, name_key):
     return not names or item[name_key] in names
 
 
+def _target_missing(data):
+    return _not_found(
+        f"No scalable target registered for service namespace: {data['ServiceNamespace']}, "
+        f"resource ID: {data['ResourceId']}, scalable dimension: {data['ScalableDimension']}")
+
+
+def _child_arn(target, kind, name_kind, name):
+    # AWS docs (API reference and CLI examples): policy and scheduled-action
+    # ARNs share one id per scalable target and end in the resource and name.
+    return (f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:{kind}:{target['_ChildId']}:"
+            f"resource/{target['ServiceNamespace']}/{target['ResourceId']}:{name_kind}/{name}")
+
+
 # ---------------------------------------------------------------------------
 # Scalable targets
 # ---------------------------------------------------------------------------
 
 
 def _register_scalable_target(data):
-    err = _require(data, "ServiceNamespace", "ResourceId", "ScalableDimension")
-    if err:
-        return err
+    _check_target_identity(data)
+    min_capacity = _capacity(data, "MinCapacity")
+    max_capacity = _capacity(data, "MaxCapacity")
     key = _target_key(data)
     existing = _targets.get(key)
     if existing is None:
-        if data.get("MinCapacity") is None or data.get("MaxCapacity") is None:
-            return _validation("MinCapacity and MaxCapacity are required when registering a new scalable target")
+        if min_capacity is None or max_capacity is None:
+            return _validation("MinCapacity and MaxCapacity are required to register a new scalable target")
         target = {
             "ServiceNamespace": data["ServiceNamespace"],
             "ResourceId": data["ResourceId"],
             "ScalableDimension": data["ScalableDimension"],
-            "RoleARN": data.get("RoleARN") or (
-                f"arn:aws:iam::{get_account_id()}:role/aws-service-role/"
-                f"{data['ServiceNamespace']}.application-autoscaling.amazonaws.com/"
-                "AWSServiceRoleForApplicationAutoScaling_ECSService"),
+            "RoleARN": f"arn:aws:iam::{get_account_id()}:{_ECS_SERVICE_LINKED_ROLE}",
             "CreationTime": time.time(),
             "SuspendedState": {"DynamicScalingInSuspended": False, "DynamicScalingOutSuspended": False,
                                "ScheduledScalingSuspended": False},
-            "ScalableTargetARN": _arn("scalable-target", _id().replace("-", "")[:28]),
+            # AWS docs example: scalable-target/ followed by 36 hex characters.
+            "ScalableTargetARN": (f"arn:aws:application-autoscaling:{get_region()}:{get_account_id()}:"
+                                  f"scalable-target/{(new_uuid() + new_uuid()).replace('-', '')[:36]}"),
+            "_ChildId": new_uuid(),
         }
     else:
-        target = existing
-    for field in ("MinCapacity", "MaxCapacity"):
-        if data.get(field) is not None:
-            target[field] = int(data[field])
+        # Work on a copy so a rejected update leaves the stored target intact.
+        target = copy.deepcopy(existing)
+    if min_capacity is not None:
+        target["MinCapacity"] = min_capacity
+    if max_capacity is not None:
+        target["MaxCapacity"] = max_capacity
     if target["MinCapacity"] > target["MaxCapacity"]:
-        return _validation("MinCapacity cannot be greater than MaxCapacity")
-    if data.get("SuspendedState"):
-        target["SuspendedState"].update(data["SuspendedState"])
+        return _validation("Minimum capacity cannot be greater than maximum capacity")
+    if data.get("RoleARN"):
+        target["RoleARN"] = data["RoleARN"]
+    suspended = data.get("SuspendedState")
+    if suspended:
+        if not isinstance(suspended, dict) or not all(isinstance(v, bool) for v in suspended.values()):
+            return _validation("SuspendedState members must be booleans")
+        target["SuspendedState"].update(suspended)
     _targets[key] = target
-    if data.get("Tags"):
-        merged = _tags.get(target["ScalableTargetARN"], {})
-        merged.update(data["Tags"])
-        _tags[target["ScalableTargetARN"]] = merged
-    return json_response({"ScalableTargetARN": target["ScalableTargetARN"]})
+    # Model docs: Tags apply when the target is created; TagResource tags an
+    # existing one.
+    if existing is None and data.get("Tags"):
+        _tags[target["ScalableTargetARN"]] = dict(data["Tags"])
+    logger.debug("Registered scalable target %s", key)
+    return _ok({"ScalableTargetARN": target["ScalableTargetARN"]})
 
 
 def _describe_scalable_targets(data):
-    if not data.get("ServiceNamespace"):
-        return _validation("ServiceNamespace is required")
+    namespace = _check_namespace(data)
     ids = data.get("ResourceIds") or []
     items = [t for t in _targets.values()
-             if t["ServiceNamespace"] == data["ServiceNamespace"]
+             if t["ServiceNamespace"] == namespace
              and (not ids or t["ResourceId"] in ids)
              and (not data.get("ScalableDimension") or t["ScalableDimension"] == data["ScalableDimension"])]
-    return json_response({"ScalableTargets": items})
+    return _paginate(items, data, "ScalableTargets")
 
 
 def _deregister_scalable_target(data):
-    err = _require(data, "ServiceNamespace", "ResourceId", "ScalableDimension")
-    if err:
-        return err
+    _check_target_identity(data)
     key = _target_key(data)
     target = _targets.get(key)
     if not target:
-        return _not_found(f"No scalable target registered for service namespace: {data['ServiceNamespace']}, "
-                          f"resource ID: {data['ResourceId']}, scalable dimension: {data['ScalableDimension']}")
-    # AWS deletes the target's scaling policies and scheduled actions with it.
+        return _target_missing(data)
+    # AWS API reference: deregistering a scalable target deletes the scaling
+    # policies and scheduled actions associated with it.
     for store in (_policies, _scheduled):
         for k in [k for k in store.keys() if k.startswith(key + "|")]:
             store.pop(k, None)
     _targets.pop(key, None)
     _tags.pop(target["ScalableTargetARN"], None)
-    return json_response({})
-
-
-def _target_or_error(data):
-    target = _targets.get(_target_key(data))
-    if not target:
-        return None, _not_found(
-            f"No scalable target registered for service namespace: {data.get('ServiceNamespace')}, "
-            f"resource ID: {data.get('ResourceId')}, scalable dimension: {data.get('ScalableDimension')}")
-    return target, None
+    return _ok({})
 
 
 # ---------------------------------------------------------------------------
@@ -198,69 +298,57 @@ def _target_or_error(data):
 
 
 def _put_scaling_policy(data):
-    err = _require(data, "PolicyName", "ServiceNamespace", "ResourceId", "ScalableDimension")
-    if err:
-        return err
-    _, err = _target_or_error(data)
-    if err:
-        return err
-    policy_type = data.get("PolicyType", "StepScaling")
-    if policy_type not in _POLICY_TYPES:
-        return _validation(f"Invalid PolicyType: {policy_type}")
-    config_key = {"StepScaling": "StepScalingPolicyConfiguration",
-                  "TargetTrackingScaling": "TargetTrackingScalingPolicyConfiguration",
-                  "PredictiveScaling": "PredictiveScalingPolicyConfiguration"}[policy_type]
-    if not data.get(config_key):
+    _check_target_identity(data, "PolicyName")
+    target = _targets.get(_target_key(data))
+    if not target:
+        return _target_missing(data)
+    # Inference: an omitted PolicyType is a step scaling policy, as in the
+    # Terraform provider's default.
+    policy_type = data.get("PolicyType") or "StepScaling"
+    if policy_type not in _MODEL_POLICY_TYPES:
+        return _validation(
+            f"1 validation error detected: Value '{policy_type}' at 'policyType' failed to satisfy constraint: "
+            f"Member must satisfy enum value set: [{', '.join(_MODEL_POLICY_TYPES)}]")
+    if policy_type not in _POLICY_CONFIG:
+        return _validation(f"MiniStack does not support {policy_type} policies")
+    config_key = _POLICY_CONFIG[policy_type]
+    config = data.get(config_key)
+    if not isinstance(config, dict) or not config:
         return _validation(f"{config_key} is required for a {policy_type} policy")
+    if policy_type == "TargetTrackingScaling" and not isinstance(config.get("TargetValue"), (int, float)):
+        return _null_error("TargetValue")
     key = f"{_target_key(data)}|{data['PolicyName']}"
     existing = _policies.get(key)
-    resource = data["ResourceId"]
-    policy_arn = existing["PolicyARN"] if existing else (
-        f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:scalingPolicy:{_id()}:"
-        f"resource/{data['ServiceNamespace']}/{resource}:policyName/{data['PolicyName']}")
-    alarms = []
-    if policy_type == "TargetTrackingScaling":
-        # AWS creates a high and a low alarm for each target tracking policy.
-        base = f"TargetTracking-{resource}"
-        alarms = [{"AlarmName": f"{base}-AlarmHigh-{_id()}",
-                   "AlarmARN": f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{base}-AlarmHigh"},
-                  {"AlarmName": f"{base}-AlarmLow-{_id()}",
-                   "AlarmARN": f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{base}-AlarmLow"}]
-        if existing:
-            alarms = existing.get("Alarms", alarms)
     policy = {
-        "PolicyARN": policy_arn,
+        "PolicyARN": existing["PolicyARN"] if existing else _child_arn(
+            target, "scalingPolicy", "policyName", data["PolicyName"]),
         "PolicyName": data["PolicyName"],
         "ServiceNamespace": data["ServiceNamespace"],
-        "ResourceId": resource,
+        "ResourceId": data["ResourceId"],
         "ScalableDimension": data["ScalableDimension"],
         "PolicyType": policy_type,
-        config_key: data[config_key],
-        "Alarms": alarms,
+        config_key: config,
         "CreationTime": existing["CreationTime"] if existing else time.time(),
     }
     _policies[key] = policy
-    return json_response({"PolicyARN": policy_arn, "Alarms": alarms})
+    return _ok({"PolicyARN": policy["PolicyARN"]})
 
 
 def _describe_scaling_policies(data):
-    if not data.get("ServiceNamespace"):
-        return _validation("ServiceNamespace is required")
+    _check_namespace(data)
     items = [p for p in _policies.values() if _matches(p, data, "PolicyNames", "PolicyName")]
-    return json_response({"ScalingPolicies": items})
+    return _paginate(items, data, "ScalingPolicies")
 
 
 def _delete_scaling_policy(data):
-    err = _require(data, "PolicyName", "ServiceNamespace", "ResourceId", "ScalableDimension")
-    if err:
-        return err
+    _check_target_identity(data, "PolicyName")
     key = f"{_target_key(data)}|{data['PolicyName']}"
     if key not in _policies:
         return _not_found(f"No scaling policy found for service namespace: {data['ServiceNamespace']}, "
                           f"resource ID: {data['ResourceId']}, scalable dimension: {data['ScalableDimension']}, "
                           f"policy name: {data['PolicyName']}")
     _policies.pop(key, None)
-    return json_response({})
+    return _ok({})
 
 
 # ---------------------------------------------------------------------------
@@ -269,47 +357,51 @@ def _delete_scaling_policy(data):
 
 
 def _put_scheduled_action(data):
-    err = _require(data, "ScheduledActionName", "ServiceNamespace", "ResourceId", "ScalableDimension")
-    if err:
-        return err
-    _, err = _target_or_error(data)
-    if err:
-        return err
+    _check_target_identity(data, "ScheduledActionName")
+    target = _targets.get(_target_key(data))
+    if not target:
+        return _target_missing(data)
     key = f"{_target_key(data)}|{data['ScheduledActionName']}"
     existing = _scheduled.get(key)
     if not existing and not data.get("Schedule"):
         return _validation("Schedule is required when creating a scheduled action")
-    action = existing or {
+    action_target = data.get("ScalableTargetAction") or {}
+    if not isinstance(action_target, dict):
+        return _validation("ScalableTargetAction must be an object")
+    for name in ("MinCapacity", "MaxCapacity"):
+        _capacity(action_target, name)
+    if (action_target.get("MinCapacity") is not None and action_target.get("MaxCapacity") is not None
+            and action_target["MinCapacity"] > action_target["MaxCapacity"]):
+        return _validation("Minimum capacity cannot be greater than maximum capacity")
+    action = copy.deepcopy(existing) if existing else {
         "ScheduledActionName": data["ScheduledActionName"],
-        "ScheduledActionARN": _arn("scheduled-action", _id()),
+        "ScheduledActionARN": _child_arn(target, "scheduledAction", "scheduledActionName",
+                                         data["ScheduledActionName"]),
         "ServiceNamespace": data["ServiceNamespace"],
         "ResourceId": data["ResourceId"],
         "ScalableDimension": data["ScalableDimension"],
         "CreationTime": time.time(),
     }
-    for field in ("Schedule", "Timezone", "StartTime", "EndTime", "ScalableTargetAction"):
+    for field in _SCHEDULED_FIELDS:
         if field in data:
             action[field] = data[field]
     _scheduled[key] = action
-    return json_response({})
+    return _ok({})
 
 
 def _describe_scheduled_actions(data):
-    if not data.get("ServiceNamespace"):
-        return _validation("ServiceNamespace is required")
+    _check_namespace(data)
     items = [a for a in _scheduled.values() if _matches(a, data, "ScheduledActionNames", "ScheduledActionName")]
-    return json_response({"ScheduledActions": items})
+    return _paginate(items, data, "ScheduledActions")
 
 
 def _delete_scheduled_action(data):
-    err = _require(data, "ScheduledActionName", "ServiceNamespace", "ResourceId", "ScalableDimension")
-    if err:
-        return err
+    _check_target_identity(data, "ScheduledActionName")
     key = f"{_target_key(data)}|{data['ScheduledActionName']}"
     if key not in _scheduled:
         return _not_found(f"No scheduled action found for name: {data['ScheduledActionName']}")
     _scheduled.pop(key, None)
-    return json_response({})
+    return _ok({})
 
 
 # ---------------------------------------------------------------------------
@@ -317,39 +409,41 @@ def _delete_scheduled_action(data):
 # ---------------------------------------------------------------------------
 
 
-def _target_arn_exists(arn):
-    return any(t["ScalableTargetARN"] == arn for t in _targets.values())
+def _tagged_target_arn(data):
+    arn = data.get("ResourceARN")
+    if not arn:
+        raise _Invalid(_null_error("ResourceARN"))
+    if not any(t["ScalableTargetARN"] == arn for t in _targets.values()):
+        raise _Invalid(_error("ResourceNotFoundException", f"Resource {arn} not found",
+                              extra={"ResourceName": arn}))
+    return arn
 
 
 def _tag_resource(data):
-    arn = data.get("ResourceARN", "")
-    if not _target_arn_exists(arn):
-        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found", 400)
-    merged = _tags.get(arn, {})
-    merged.update(data.get("Tags") or {})
+    arn = _tagged_target_arn(data)
+    if not data.get("Tags"):
+        return _null_error("Tags")
+    merged = dict(_tags.get(arn, {}))
+    merged.update(data["Tags"])
     _tags[arn] = merged
-    return json_response({})
+    return _ok({})
 
 
 def _untag_resource(data):
-    arn = data.get("ResourceARN", "")
-    if not _target_arn_exists(arn):
-        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found", 400)
-    existing = _tags.get(arn, {})
-    for key in data.get("TagKeys") or []:
-        existing.pop(key, None)
-    if existing:
-        _tags[arn] = existing
+    arn = _tagged_target_arn(data)
+    if data.get("TagKeys") is None:
+        return _null_error("TagKeys")
+    remaining = {k: v for k, v in _tags.get(arn, {}).items() if k not in data["TagKeys"]}
+    if remaining:
+        _tags[arn] = remaining
     else:
         _tags.pop(arn, None)
-    return json_response({})
+    return _ok({})
 
 
 def _list_tags_for_resource(data):
-    arn = data.get("ResourceARN", "")
-    if not _target_arn_exists(arn):
-        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found", 400)
-    return json_response({"Tags": _tags.get(arn, {})})
+    arn = _tagged_target_arn(data)
+    return _ok({"Tags": dict(_tags.get(arn, {}))})
 
 
 _HANDLERS = {
@@ -368,14 +462,23 @@ _HANDLERS = {
 }
 
 
+def call(action, data):
+    """Run one operation in-process (used by the CloudFormation provisioners)."""
+    try:
+        return _HANDLERS[action](data)
+    except _Invalid as exc:
+        return exc.response
+
+
 async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
     try:
         data = json.loads(body) if body else {}
     except json.JSONDecodeError:
-        return error_response_json("SerializationException", "Invalid JSON", 400)
-    handler = _HANDLERS.get(action)
-    if not handler:
-        return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
-    return handler(data)
+        return _error("SerializationException", "Invalid JSON")
+    if not isinstance(data, dict):
+        return _error("SerializationException", "Request body must be a JSON object")
+    if action not in _HANDLERS:
+        return _error("UnknownOperationException", f"Unknown operation: {action}")
+    return call(action, data)
