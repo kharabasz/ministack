@@ -8,7 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- **EC2 — Verified Access control plane** — instances, OIDC and device trust providers, groups and `load-balancer` / `network-interface` endpoints: create, describe, modify and delete, trust provider attach and detach (one per type per instance), instance logging configuration, and group and endpoint policies, per account and region. Endpoints are `active` on create and report `deleting` on delete; unknown IDs answer `InvalidVerifiedAccess<Kind>Id.NotFound`, and deleting a trust provider that is attached, an instance with groups or a group with endpoints is refused. OIDC client secrets are stored but never returned. Tags work through `TagSpecifications` and `DescribeTags`. `rds` and `cidr` endpoints answer `UnsupportedOperation`. No access evaluation.
+- **EC2 — Verified Access control plane** — instances, trust providers, groups and endpoints: create, describe, modify and delete, trust provider attach and detach, instance logging configuration, and group and endpoint policies, per account and region, as the `aws_verifiedaccess_*` Terraform resources call them. An instance takes one user trust provider and any number of device trust providers; deleting an attached trust provider, an instance with groups or a group with endpoints answers `InvalidParameterValue`; `rds` and `cidr` endpoints answer `UnsupportedOperation`; OIDC client secrets are never returned. No access evaluation. Contributed by @kharabasz.
 
 ## [1.5.29] — 2026-10-17
 
