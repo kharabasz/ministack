@@ -24556,6 +24556,77 @@ def test_cfn_state_machine_update_keeps_arn_and_executions(cfn, sfn):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_state_machine_encryption_configuration(cfn, sfn):
+    """A declared EncryptionConfiguration reaches DescribeStateMachine on
+    create, changes in place on update, and dropping it reverts the machine
+    to AWS_OWNED_KEY."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sfn-enc-{uid}"
+    key_arn = "arn:aws:kms:us-east-1:000000000000:key/cfn-sfn-key"
+
+    def template(encryption):
+        props = {
+            "StateMachineName": f"cfn-sfn-enc-{uid}",
+            "DefinitionString": _sfn_definition_json("enc"),
+            "RoleArn": "arn:aws:iam::000000000000:role/sfn-role",
+        }
+        if encryption is not None:
+            props["EncryptionConfiguration"] = encryption
+        return json.dumps({
+            "Resources": {"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": props}},
+            "Outputs": {"Arn": {"Value": {"Ref": "SM"}}},
+        })
+
+    cmk = {"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": key_arn,
+           "KmsDataKeyReusePeriodSeconds": 300}
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(cmk))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == {
+            "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key_arn,
+            "kmsDataKeyReusePeriodSeconds": 300}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            {"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": key_arn,
+             "KmsDataKeyReusePeriodSeconds": "600"}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Arn") == arn
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == {
+            "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key_arn,
+            "kmsDataKeyReusePeriodSeconds": 600}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == {
+            "type": "AWS_OWNED_KEY"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_state_machine_invalid_encryption_configuration_fails(cfn, sfn):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sfn-enc-bad-{uid}"
+    name = f"cfn-sfn-enc-bad-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({
+        "Resources": {"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {
+            "StateMachineName": name,
+            "DefinitionString": _sfn_definition_json("enc"),
+            "RoleArn": "arn:aws:iam::000000000000:role/sfn-role",
+            "EncryptionConfiguration": {"Type": "CUSTOMER_MANAGED_KMS_KEY"},
+        }}},
+    }))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] in ("CREATE_FAILED", "ROLLBACK_COMPLETE"), stack["StackStatus"]
+        assert "InvalidEncryptionConfiguration" in _stack_event_reasons(cfn, stack_name)
+        assert name not in [m["name"] for m in sfn.list_state_machines()["stateMachines"]]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
 def test_cfn_state_machine_type_change_under_custom_name_fails_loudly(cfn, sfn):
     """StateMachineType requires replacement, which CloudFormation refuses
     for a custom-named machine: the stack rolls back and the machine keeps
