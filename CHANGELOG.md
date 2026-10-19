@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **S3 — replication rule options** — `PutBucketReplication` dropped `EncryptionConfiguration`, `ReplicationTime` and `Metrics` on the destination and `SourceSelectionCriteria` and `ExistingObjectReplication` on the rule; they are stored and returned by `GetBucketReplication`.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

@@ -9535,3 +9535,34 @@ def test_s3_copy_and_multipart_refuse_object_lock_headers_without_object_lock(s3
             s3.delete_object(Bucket=bkt, Key=v["Key"], VersionId=v["VersionId"])
         s3.delete_bucket(Bucket=bkt)
 
+
+
+def test_s3_replication_keeps_destination_and_rule_options(s3):
+    """Replication rules round-trip encryption, replication time, metrics and source selection settings."""
+    import uuid as _uuid
+    src, dst = f"repl-src-{_uuid.uuid4().hex[:8]}", f"repl-dst-{_uuid.uuid4().hex[:8]}"
+    for name in (src, dst):
+        s3.create_bucket(Bucket=name)
+        s3.put_bucket_versioning(Bucket=name, VersioningConfiguration={"Status": "Enabled"})
+    rule = {
+        "ID": "all", "Status": "Enabled", "Priority": 1, "Filter": {"Prefix": ""},
+        "DeleteMarkerReplication": {"Status": "Enabled"},
+        "SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "Enabled"},
+                                    "ReplicaModifications": {"Status": "Enabled"}},
+        "ExistingObjectReplication": {"Status": "Disabled"},
+        "Destination": {
+            "Bucket": f"arn:aws:s3:::{dst}",
+            "EncryptionConfiguration": {"ReplicaKmsKeyID": "arn:aws:kms:us-east-1:000000000000:key/replica"},
+            "ReplicationTime": {"Status": "Enabled", "Time": {"Minutes": 15}},
+            "Metrics": {"Status": "Enabled", "EventThreshold": {"Minutes": 15}},
+        },
+    }
+    s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={
+        "Role": "arn:aws:iam::000000000000:role/replication", "Rules": [rule]})
+    got = s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"][0]
+    assert got["SourceSelectionCriteria"] == rule["SourceSelectionCriteria"]
+    assert got["ExistingObjectReplication"] == {"Status": "Disabled"}
+    dest = got["Destination"]
+    assert dest["EncryptionConfiguration"] == rule["Destination"]["EncryptionConfiguration"]
+    assert dest["ReplicationTime"] == {"Status": "Enabled", "Time": {"Minutes": 15}}
+    assert dest["Metrics"] == {"Status": "Enabled", "EventThreshold": {"Minutes": 15}}
