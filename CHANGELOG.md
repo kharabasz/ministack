@@ -312,6 +312,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **IAM — trust policies with `NotPrincipal`** — `CreateRole`, `UpdateAssumeRolePolicy` and `AWS::IAM::Role` stored them; they now answer `MalformedPolicyDocument` (`Allow with NotPrincipal is not allowed.`, `AssumeRole policy must not contain NotPrincipal field.`). Contributed by @iot-rocket.
 - **CloudTrail — `RecursiveLogging` on trails** — `CreateTrail` and `UpdateTrail` ignored it; trails now store it (default `true`, kept by an `UpdateTrail` without it) and return it from every trail response. Contributed by @iot-rocket.
 - **CloudFormation — callback URLs under `USE_SSL=1`** — the custom resource `ResponseURL` and the `WaitConditionHandle` URL were always `http://`, which the TLS-only gateway drops, so a handler's `urllib` PUT never arrived and the stack waited out `ServiceTimeout`; both are now `https://` when `USE_SSL` is on, and MiniStack's Lambdas get `SSL_CERT_FILE` set to the gateway's CA bundle, which Python's `ssl` reads. Contributed by @iot-rocket.
+### Added
+- **Application Auto Scaling — control plane** — new `application-autoscaling` service: scalable targets (register, describe, deregister), step / target-tracking / predictive scaling policies, scheduled actions and tags, per account and region; deregistering a target removes its policies and actions. Nothing changes capacity.
 
 ## [1.5.29] — 2026-10-17
 
