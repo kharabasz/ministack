@@ -1985,13 +1985,12 @@ def test_cloudfront_list_streaming_distributions_empty(cloudfront):
     assert lst.get("Items", []) == []
 
 
-def test_cloudfront_list_vpc_origins_empty(cloudfront):
-    resp = cloudfront.list_vpc_origins()
-    lst = resp["VpcOriginList"]
-    assert lst["MaxItems"] == 100
-    assert lst["IsTruncated"] is False
-    assert lst["Quantity"] == 0
-    assert lst.get("Items", []) == []
+def test_cloudfront_list_vpc_origins_echoes_max_items(cloudfront):
+    lst = cloudfront.list_vpc_origins(MaxItems="5")["VpcOriginList"]
+    assert lst["MaxItems"] == 5
+    assert lst["Marker"] == ""
+    assert lst["Quantity"] == len(lst.get("Items", [])) <= 5
+    assert cloudfront.list_vpc_origins()["VpcOriginList"]["MaxItems"] == 100
 
 
 def test_cloudfront_list_realtime_log_configs_empty(cloudfront):
@@ -3068,37 +3067,307 @@ def test_cloudfront_get_distribution_xml_has_no_namespace_prefixes(cloudfront):
     assert b"<Origins>" in raw and b"<DefaultCacheBehavior>" in raw
 
 
-def test_cloudfront_vpc_origin_lifecycle_and_distribution_reference(cloudfront):
-    """VPC origins are created Deployed, updated with If-Match, referenced by a distribution and protected while in use."""
-    import uuid as _uuid
-    lb = "arn:aws:elasticloadbalancing:us-east-2:000000000000:loadbalancer/app/api/0123456789abcdef"
-    cfg = {"Name": "api", "Arn": lb, "HTTPPort": 80, "HTTPSPort": 443, "OriginProtocolPolicy": "https-only",
-           "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]}}
-    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=cfg, Tags={"Items": [{"Key": "team", "Value": "platform"}]})
-    vo = created["VpcOrigin"]
-    assert vo["Id"].startswith("vo_") and vo["Status"] == "Deployed"
-    assert vo["VpcOriginEndpointConfig"]["Arn"] == lb
-    assert cloudfront.list_tags_for_resource(Resource=vo["Arn"])["Tags"]["Items"] == [{"Key": "team", "Value": "platform"}]
-    got = cloudfront.get_vpc_origin(Id=vo["Id"])
-    assert got["VpcOrigin"]["VpcOriginEndpointConfig"]["OriginSslProtocols"]["Items"] == ["TLSv1.2"]
-    updated = cloudfront.update_vpc_origin(Id=vo["Id"], IfMatch=got["ETag"],
-                                           VpcOriginEndpointConfig={**cfg, "HTTPSPort": 8443})
-    assert updated["VpcOrigin"]["VpcOriginEndpointConfig"]["HTTPSPort"] == 8443
-    assert [s["Id"] for s in cloudfront.list_vpc_origins()["VpcOriginList"]["Items"]] == [vo["Id"]]
+# ---------------------------------------------------------------------------
+# VPC origins
+# ---------------------------------------------------------------------------
 
-    dist = cloudfront.create_distribution(DistributionConfig={
-        "CallerReference": str(_uuid.uuid4()), "Comment": "", "Enabled": True,
+
+def _vpc_origin_endpoint_config(**overrides):
+    lb = f"arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/vo-{_uuid_mod.uuid4().hex[:8]}/{_uuid_mod.uuid4().hex[:16]}"
+    cfg = {"Name": f"vo-{_uuid_mod.uuid4().hex[:8]}", "Arn": lb, "HTTPPort": 80, "HTTPSPort": 443,
+           "OriginProtocolPolicy": "https-only", "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]}}
+    cfg.update(overrides)
+    return cfg
+
+
+def _delete_vpc_origin_if_present(cloudfront, vo_id):
+    try:
+        etag = cloudfront.get_vpc_origin(Id=vo_id)["ETag"]
+        cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=etag)
+    except ClientError:
+        pass
+
+
+@pytest.fixture
+def vpc_origin(cloudfront):
+    cfg = _vpc_origin_endpoint_config()
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=cfg)
+    try:
+        yield created
+    finally:
+        _delete_vpc_origin_if_present(cloudfront, created["VpcOrigin"]["Id"])
+
+
+def _raw_vpc_origin_xml(name, arn, http_port="80", https_port="443", ssl=""):
+    ports = ""
+    if http_port is not None:
+        ports += f"<HTTPPort>{http_port}</HTTPPort>"
+    if https_port is not None:
+        ports += f"<HTTPSPort>{https_port}</HTTPSPort>"
+    return (
+        '<CreateVpcOriginRequest xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/">'
+        f"<VpcOriginEndpointConfig><Name>{name}</Name><Arn>{arn}</Arn>{ports}"
+        f"<OriginProtocolPolicy>https-only</OriginProtocolPolicy>{ssl}</VpcOriginEndpointConfig>"
+        "</CreateVpcOriginRequest>"
+    ).encode()
+
+
+def _post_raw_vpc_origin(body):
+    req = urllib.request.Request(f"{ENDPOINT}/2020-05-31/vpc-origin", data=body, method="POST",
+                                 headers={"Content-Type": "application/xml"})
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=10)
+    return exc.value.code, exc.value.read().decode()
+
+
+def test_cloudfront_vpc_origin_create_get_update(cloudfront):
+    cfg = _vpc_origin_endpoint_config()
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=cfg,
+                                           Tags={"Items": [{"Key": "team", "Value": "edge"}]})
+    vo = created["VpcOrigin"]
+    try:
+        assert created["ResponseMetadata"]["HTTPStatusCode"] == 202
+        assert created["Location"].endswith(f"/2020-05-31/vpc-origin/{vo['Id']}")
+        assert created["ETag"]
+        assert vo["Id"].startswith("vo_") and vo["Status"] == "Deployed"
+        assert vo["Arn"] == f"arn:aws:cloudfront::000000000000:vpcorigin/{vo['Id']}"
+        assert vo["VpcOriginEndpointConfig"]["Arn"] == cfg["Arn"]
+        assert cloudfront.list_tags_for_resource(Resource=vo["Arn"])["Tags"]["Items"] == [{"Key": "team", "Value": "edge"}]
+
+        got = cloudfront.get_vpc_origin(Id=vo["Id"])
+        assert got["ETag"] == created["ETag"]
+        assert got["VpcOrigin"]["VpcOriginEndpointConfig"]["OriginSslProtocols"] == {"Quantity": 1, "Items": ["TLSv1.2"]}
+
+        updated = cloudfront.update_vpc_origin(Id=vo["Id"], IfMatch=got["ETag"],
+                                               VpcOriginEndpointConfig={**cfg, "HTTPSPort": 8443})
+        assert updated["ResponseMetadata"]["HTTPStatusCode"] == 202
+        assert updated["ETag"] != got["ETag"]
+        assert updated["VpcOrigin"]["VpcOriginEndpointConfig"]["HTTPSPort"] == 8443
+        assert cloudfront.get_vpc_origin(Id=vo["Id"])["ETag"] == updated["ETag"]
+
+        summaries = {s["Id"]: s for s in cloudfront.list_vpc_origins()["VpcOriginList"].get("Items", [])}
+        assert summaries[vo["Id"]]["OriginEndpointArn"] == cfg["Arn"]
+        assert summaries[vo["Id"]]["Name"] == cfg["Name"]
+    finally:
+        _delete_vpc_origin_if_present(cloudfront, vo["Id"])
+
+
+def test_cloudfront_vpc_origin_ssl_protocols_default(cloudfront):
+    cfg = _vpc_origin_endpoint_config()
+    cfg.pop("OriginSslProtocols")
+    vo = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=cfg)["VpcOrigin"]
+    try:
+        assert vo["VpcOriginEndpointConfig"]["OriginSslProtocols"]["Items"] == ["TLSv1.2"]
+    finally:
+        _delete_vpc_origin_if_present(cloudfront, vo["Id"])
+
+
+def test_cloudfront_vpc_origin_delete_and_tags_removed(cloudfront):
+    vo = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vpc_origin_endpoint_config(),
+                                      Tags={"Items": [{"Key": "k", "Value": "v"}]})
+    vo_id, arn, etag = vo["VpcOrigin"]["Id"], vo["VpcOrigin"]["Arn"], vo["ETag"]
+    deleted = cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=etag)
+    assert deleted["ResponseMetadata"]["HTTPStatusCode"] == 202
+    assert deleted["VpcOrigin"]["Status"] == "Deleting"
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_vpc_origin(Id=vo_id)
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    with pytest.raises(ClientError) as exc:
+        cloudfront.list_tags_for_resource(Resource=arn)
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+    assert vo_id not in [s["Id"] for s in cloudfront.list_vpc_origins()["VpcOriginList"].get("Items", [])]
+
+
+def test_cloudfront_vpc_origin_tag_untag(cloudfront, vpc_origin):
+    arn = vpc_origin["VpcOrigin"]["Arn"]
+    cloudfront.tag_resource(Resource=arn, Tags={"Items": [{"Key": "a", "Value": "1"}, {"Key": "b", "Value": "2"}]})
+    cloudfront.untag_resource(Resource=arn, TagKeys={"Items": ["a"]})
+    assert cloudfront.list_tags_for_resource(Resource=arn)["Tags"]["Items"] == [{"Key": "b", "Value": "2"}]
+
+
+def test_cloudfront_vpc_origin_not_found(cloudfront):
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_vpc_origin(Id="vo_doesnotexist")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_vpc_origin(Id="vo_doesnotexist", IfMatch="x",
+                                     VpcOriginEndpointConfig=_vpc_origin_endpoint_config())
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_vpc_origin(Id="vo_doesnotexist", IfMatch="x")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cloudfront_vpc_origin_if_match(cloudfront, vpc_origin):
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    cfg = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]
+    for call in (lambda m: cloudfront.update_vpc_origin(Id=vo_id, IfMatch=m, VpcOriginEndpointConfig=cfg),
+                 lambda m: cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=m)):
+        with pytest.raises(ClientError) as exc:
+            call("stale")
+        assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+    # botocore marks IfMatch required, so send the missing header over HTTP.
+    for method, data in (("PUT", b"<VpcOriginEndpointConfig/>"), ("DELETE", None)):
+        req = urllib.request.Request(f"{ENDPOINT}/2020-05-31/vpc-origin/{vo_id}", data=data, method=method)
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc.value.code == 400
+        assert "InvalidIfMatchVersion" in exc.value.read().decode()
+    assert cloudfront.get_vpc_origin(Id=vo_id)["ETag"] == vpc_origin["ETag"]
+
+
+def test_cloudfront_vpc_origin_duplicate_endpoint(cloudfront, vpc_origin):
+    endpoint = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]["Arn"]
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vpc_origin_endpoint_config(Arn=endpoint))
+    assert exc.value.response["Error"]["Code"] == "EntityAlreadyExists"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+
+    other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vpc_origin_endpoint_config())
+    try:
+        with pytest.raises(ClientError) as exc:
+            cloudfront.update_vpc_origin(Id=other["VpcOrigin"]["Id"], IfMatch=other["ETag"],
+                                         VpcOriginEndpointConfig=_vpc_origin_endpoint_config(Arn=endpoint))
+        assert exc.value.response["Error"]["Code"] == "EntityAlreadyExists"
+        # Updating an origin with its own endpoint is not a conflict.
+        same = cloudfront.update_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"], IfMatch=vpc_origin["ETag"],
+                                            VpcOriginEndpointConfig=vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"])
+        assert same["ResponseMetadata"]["HTTPStatusCode"] == 202
+    finally:
+        _delete_vpc_origin_if_present(cloudfront, other["VpcOrigin"]["Id"])
+
+
+@pytest.mark.parametrize("overrides,code", [
+    ({"OriginProtocolPolicy": "redirect-to-https"}, "InvalidArgument"),
+    ({"HTTPPort": 0}, "InvalidArgument"),
+    ({"HTTPSPort": 70000}, "InvalidArgument"),
+    ({"Arn": "arn:aws:s3:::bucket"}, "InvalidArgument"),
+    ({"OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.3"]}}, "InvalidArgument"),
+    ({"OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.2"]}}, "InconsistentQuantities"),
+], ids=["policy", "http-port", "https-port", "arn", "ssl-protocol", "quantity"])
+def test_cloudfront_vpc_origin_rejects_invalid_config(cloudfront, overrides, code):
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vpc_origin_endpoint_config(**overrides))
+    assert exc.value.response["Error"]["Code"] == code
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+@pytest.mark.parametrize("http_port,https_port", [("eighty", "443"), (None, "443"), ("80", None)],
+                         ids=["non-numeric", "missing-http", "missing-https"])
+def test_cloudfront_vpc_origin_rejects_bad_ports_over_http(http_port, https_port):
+    lb = f"arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/raw/{_uuid_mod.uuid4().hex[:16]}"
+    status, text = _post_raw_vpc_origin(_raw_vpc_origin_xml("raw", lb, http_port, https_port))
+    assert status == 400
+    assert "InvalidArgument" in text
+
+
+def test_cloudfront_vpc_origin_list_pagination(cloudfront):
+    ids = [cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vpc_origin_endpoint_config())["VpcOrigin"]["Id"]
+           for _ in range(3)]
+    try:
+        seen, marker = [], ""
+        while True:
+            page = cloudfront.list_vpc_origins(MaxItems="2", Marker=marker)["VpcOriginList"]
+            assert page["MaxItems"] == 2 and page["Marker"] == marker
+            assert page["Quantity"] == len(page.get("Items", [])) <= 2
+            seen += [s["Id"] for s in page.get("Items", [])]
+            if not page["IsTruncated"]:
+                assert "NextMarker" not in page
+                break
+            marker = page["NextMarker"]
+        assert set(ids) <= set(seen) and len(seen) == len(set(seen))
+    finally:
+        for vo_id in ids:
+            _delete_vpc_origin_if_present(cloudfront, vo_id)
+
+
+def test_cloudfront_vpc_origin_in_use_by_distribution(cloudfront, vpc_origin):
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    cfg = {
+        "CallerReference": str(_uuid_mod.uuid4()), "Comment": "", "Enabled": True,
         "Origins": {"Quantity": 1, "Items": [{"Id": "api", "DomainName": "api.internal.example.com",
-                                              "VpcOriginConfig": {"VpcOriginId": vo["Id"]}}]},
+                                              "VpcOriginConfig": {"VpcOriginId": vo_id}}]},
         "DefaultCacheBehavior": {"TargetOriginId": "api", "ViewerProtocolPolicy": "https-only",
                                  "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"},
-    })["Distribution"]
-    origin = cloudfront.get_distribution(Id=dist["Id"])["Distribution"]["DistributionConfig"]["Origins"]["Items"][0]
-    assert origin["VpcOriginConfig"]["VpcOriginId"] == vo["Id"]
+    }
+    created = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id, dist_etag = created["Distribution"]["Id"], created["ETag"]
+    try:
+        origin = cloudfront.get_distribution(Id=dist_id)["Distribution"]["DistributionConfig"]["Origins"]["Items"][0]
+        assert origin["VpcOriginConfig"]["VpcOriginId"] == vo_id
 
+        with pytest.raises(ClientError) as exc:
+            cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=vpc_origin["ETag"])
+        assert exc.value.response["Error"]["Code"] == "CannotDeleteEntityWhileInUse"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+
+        # Point the distribution at a custom origin instead; the VPC origin is then free.
+        cfg["Enabled"] = False
+        cfg["Origins"] = {"Quantity": 1, "Items": [{
+            "Id": "api", "DomainName": "api.example.com",
+            "CustomOriginConfig": {"HTTPPort": 80, "HTTPSPort": 443, "OriginProtocolPolicy": "https-only"}}]}
+        dist_etag = cloudfront.update_distribution(Id=dist_id, IfMatch=dist_etag, DistributionConfig=cfg)["ETag"]
+        cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=vpc_origin["ETag"])
+        with pytest.raises(ClientError) as exc:
+            cloudfront.get_vpc_origin(Id=vo_id)
+        assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+    finally:
+        if cfg["Enabled"]:
+            cfg["Enabled"] = False
+            dist_etag = cloudfront.update_distribution(Id=dist_id, IfMatch=dist_etag, DistributionConfig=cfg)["ETag"]
+        cloudfront.delete_distribution(Id=dist_id, IfMatch=dist_etag)
+
+
+def test_cloudfront_vpc_origin_id_in_comment_is_not_a_reference(cloudfront, vpc_origin):
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    cfg = {**_CF_DIST_CONFIG, "CallerReference": str(_uuid_mod.uuid4()), "Comment": f"mentions {vo_id}",
+           "Enabled": False}
+    created = cloudfront.create_distribution(DistributionConfig=cfg)
+    try:
+        cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=vpc_origin["ETag"])
+    finally:
+        cloudfront.delete_distribution(Id=created["Distribution"]["Id"], IfMatch=created["ETag"])
+
+
+def test_cloudfront_vpc_origins_are_account_scoped(cloudfront, vpc_origin):
+    import boto3
+
+    other = boto3.client("cloudfront", endpoint_url=ENDPOINT, region_name="us-east-1",
+                         aws_access_key_id="111111111111", aws_secret_access_key="test")
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
     with pytest.raises(ClientError) as exc:
-        cloudfront.delete_vpc_origin(Id=vo["Id"], IfMatch=updated["ETag"])
-    assert exc.value.response["Error"]["Code"] == "CannotDeleteEntityWhileInUse"
-    with pytest.raises(ClientError) as exc:
-        cloudfront.delete_vpc_origin(Id=vo["Id"], IfMatch="stale")
-    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+        other.get_vpc_origin(Id=vo_id)
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+    assert vo_id not in [s["Id"] for s in other.list_vpc_origins()["VpcOriginList"].get("Items", [])]
+    # The same endpoint may back a VPC origin in another account.
+    endpoint = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]["Arn"]
+    theirs = other.create_vpc_origin(VpcOriginEndpointConfig=_vpc_origin_endpoint_config(Arn=endpoint))
+    try:
+        assert theirs["VpcOrigin"]["AccountId"] == "111111111111"
+        assert theirs["VpcOrigin"]["Arn"].startswith("arn:aws:cloudfront::111111111111:vpcorigin/")
+    finally:
+        other.delete_vpc_origin(Id=theirs["VpcOrigin"]["Id"], IfMatch=theirs["ETag"])
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("permission", ["none", "allow", "explicit-deny", "other-resource"])
+def test_cloudfront_vpc_origin_permission_contract(auth_enabled, iam_user, vpc_origin, permission):
+    vo_arn = vpc_origin["VpcOrigin"]["Arn"]
+    statements = []
+    if permission != "none":
+        resource = vo_arn.rsplit("/", 1)[0] + "/vo_other" if permission == "other-resource" else vo_arn
+        statements.append({"Effect": "Allow", "Action": "cloudfront:GetVpcOrigin", "Resource": resource})
+    if permission == "explicit-deny":
+        statements.append({"Effect": "Deny", "Action": "cloudfront:GetVpcOrigin", "Resource": vo_arn})
+    policy = {"Version": "2012-10-17", "Statement": statements} if statements else None
+    client = iam_user(policy=policy).client("cloudfront", region="us-east-1")
+    if auth_enabled and permission != "allow":
+        with pytest.raises(ClientError) as exc:
+            client.get_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"])
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    else:
+        got = client.get_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"])
+        assert got["VpcOrigin"]["Arn"] == vo_arn
