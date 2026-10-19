@@ -3020,6 +3020,8 @@ def _create_archive(data):
         "EventCount": 0,
         "SizeBytes": 0,
     }
+    if data.get("KmsKeyIdentifier"):
+        _archives[name]["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
     return json_response({"ArchiveArn": arn, "State": "ENABLED", "CreationTime": _archives[name]["CreationTime"]})
 
 
@@ -3057,6 +3059,12 @@ def _update_archive(data):
         archive["EventPattern"] = ep
     if "RetentionDays" in data:
         archive["RetentionDays"] = int(data["RetentionDays"])
+    if "KmsKeyIdentifier" in data:
+        # An empty identifier switches the archive back to an AWS owned key.
+        if data["KmsKeyIdentifier"]:
+            archive["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
+        else:
+            archive.pop("KmsKeyIdentifier", None)
 
     archive["LastUpdatedTime"] = _now_ts()
     return json_response({
@@ -3078,7 +3086,7 @@ def _list_archives(data):
             continue
         if state and archive.get("State") != state:
             continue
-        results.append(archive)
+        results.append({k: v for k, v in archive.items() if k != "KmsKeyIdentifier"})
     return json_response({"Archives": results})
 
 

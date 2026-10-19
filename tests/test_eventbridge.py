@@ -5770,3 +5770,17 @@ def test_eventbridge_api_destination_dynamic_http_parameters_use_original_event(
         )["Targets"][0]["HttpParameters"] == http_parameters
     finally:
         server.shutdown()
+
+
+def test_eventbridge_archive_kms_key_identifier(eb):
+    """Archives keep KmsKeyIdentifier; an empty identifier on update returns to the AWS owned key."""
+    bus_arn = eb.describe_event_bus(Name="default")["Arn"]
+    key = "arn:aws:kms:us-east-1:000000000000:key/archive-key"
+    eb.create_archive(ArchiveName="kms-archive", EventSourceArn=bus_arn, KmsKeyIdentifier=key)
+    assert eb.describe_archive(ArchiveName="kms-archive")["KmsKeyIdentifier"] == key
+    other = "arn:aws:kms:us-east-1:000000000000:key/other"
+    eb.update_archive(ArchiveName="kms-archive", KmsKeyIdentifier=other)
+    assert eb.describe_archive(ArchiveName="kms-archive")["KmsKeyIdentifier"] == other
+    eb.update_archive(ArchiveName="kms-archive", KmsKeyIdentifier="")
+    assert "KmsKeyIdentifier" not in eb.describe_archive(ArchiveName="kms-archive")
+    eb.delete_archive(ArchiveName="kms-archive")

@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EventBridge — archive KMS keys** — `CreateArchive` and `UpdateArchive` dropped `KmsKeyIdentifier`; it is stored and returned by `DescribeArchive`, and an empty identifier on update returns the archive to an AWS owned key.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
