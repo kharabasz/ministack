@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **EventBridge Schemas — registries and schemas** — new `schemas` service: registries and versioned `OpenApi3` / `JSONSchemaDraft4` schemas (create, describe by version, update, delete, list, list versions) and tags, per account and region; `UpdateSchema` adds a version only when the content or type changes. No discovery or code bindings.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
