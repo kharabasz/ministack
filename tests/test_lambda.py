@@ -4920,6 +4920,82 @@ def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach
         assert not [key for key in payload if key.startswith("_")]
 
 
+# A third-party publisher account (Datadog's, per its documentation); nothing in
+# MiniStack holds its state unless a test seeds it.
+_VENDOR_ACCOUNT = "464622532012"
+
+
+def _vendor_arn(layer_name="Datadog-Extension-ARM", version=7, region=_FOREIGN_REGION):
+    return f"arn:aws:lambda:{region}:{_VENDOR_ACCOUNT}:layer:{layer_name}:{version}"
+
+
+# (setting, seeded layer name, grant principal, ARN, expected error code, expected CodeSize)
+@pytest.mark.parametrize(("accounts", "layer_name", "granted_to", "arn", "error", "code_size"), [
+    pytest.param({_VENDOR_ACCOUNT}, None, None, _vendor_arn(), None, 0, id="listed-account-unheld-layer"),
+    pytest.param(set(), None, None, _vendor_arn(), _DENIED, None, id="setting-unset"),
+    pytest.param({"111111111111"}, None, None, _vendor_arn(), _DENIED, None, id="account-not-listed"),
+    pytest.param({_VENDOR_ACCOUNT}, None, None, _vendor_arn(region="eu-central-1"), _DENIED, None,
+                 id="listed-account-another-region"),
+    # A layer MiniStack holds goes through its resource policy, listed or not.
+    pytest.param({_VENDOR_ACCOUNT}, "held", None, _vendor_arn("held"), _DENIED, None,
+                 id="listed-account-held-layer-no-grant"),
+    pytest.param({_VENDOR_ACCOUNT}, "held", "*", _vendor_arn("held"), None, _FOREIGN_CODE_SIZE,
+                 id="listed-account-held-layer-granted"),
+])
+def test_lambda_public_layer_accounts_verdicts(monkeypatch, accounts, layer_name, granted_to, arn,
+                                               error, code_size):
+    """LAMBDA_PUBLIC_LAYER_ACCOUNTS: an unheld layer of a listed account attaches
+    and reads as an empty version, like an AWS-published extension; every other
+    case keeps the denial it had before."""
+    import ministack.services.lambda_svc as _lsvc
+
+    monkeypatch.setattr(_lsvc, "LAMBDA_PUBLIC_LAYER_ACCOUNTS", frozenset(accounts))
+    with _foreign_layer(layer_name, granted_to=granted_to, owner=_VENDOR_ACCOUNT):
+        version_config, attach, payload, read = _layer_verdicts(arn)
+    if error:
+        assert attach == read == (error, _layer_access_denied(arn))
+        return
+    assert attach is None and read is None
+    assert version_config["Content"]["CodeSize"] == code_size
+    assert (payload["LayerVersionArn"], payload["Version"], payload["Content"]["CodeSize"]) == (
+        arn, 7, code_size)
+    assert not [key for key in payload if key.startswith("_")]
+
+
+def test_lambda_public_layer_accounts_create_function(monkeypatch):
+    """CreateFunction attaches the listed account's layer and reports it with CodeSize 0."""
+    import ministack.app as app_mod
+    from ministack.services import lambda_svc
+
+    # In process, so the execution role is not created; AUTH=true would refuse it.
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    monkeypatch.setattr(lambda_svc, "_functions", AccountRegionScopedDict())
+    monkeypatch.setattr(lambda_svc, "LAMBDA_PUBLIC_LAYER_ACCOUNTS", frozenset({_VENDOR_ACCOUNT}))
+    arn = _vendor_arn(version=97)
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        status, _headers, body = lambda_svc._create_function({
+            "FunctionName": "public-layer-fn", "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+            "Handler": "index.handler", "Layers": [arn],
+            "Code": {"ZipFile": base64.b64encode(_make_zip("def handler(e, c): return 1")).decode()}})
+        assert status == 201, body
+        assert json.loads(body)["Layers"] == [{"Arn": arn, "CodeSize": 0}]
+        status, _headers, body = lambda_svc._get_function("public-layer-fn")
+        assert json.loads(body)["Configuration"]["Layers"] == [{"Arn": arn, "CodeSize": 0}]
+
+
+def test_lambda_public_layer_accounts_parsing(caplog):
+    """Entries are trimmed, empty ones skipped, and non-account values logged and dropped."""
+    from ministack.services import lambda_svc
+
+    with caplog.at_level("WARNING", logger="lambda"):
+        parsed = lambda_svc._parse_public_layer_accounts(
+            f" {_VENDOR_ACCOUNT} , ,123456789012,datadog,{_vendor_arn()},12345678901")
+    assert parsed == frozenset({_VENDOR_ACCOUNT, "123456789012"})
+    ignored = [record.args[0] for record in caplog.records if "LAMBDA_PUBLIC_LAYER_ACCOUNTS" in record.msg]
+    assert ignored == ["datadog", _vendor_arn(), "12345678901"]
+    assert lambda_svc._parse_public_layer_accounts("") == frozenset()
+
+
 def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatch):
     """Through the app with AUTH=true as an IAM user of the consuming account: the
     layer policy decides, and a denial names that user the way AWS does."""
@@ -15169,3 +15245,4 @@ def test_slow_code_update_does_not_block_independent_resources(functions, monkey
 def test_missing_resource_keeps_not_found_response(functions, operation):
     assert _update(operation, "stale", name="missing")[0] == 404
     assert _lambda_mod._update_alias("revision-test", "missing", {"RevisionId": "stale"})[0] == 404
+
