@@ -15182,3 +15182,21 @@ def test_slow_code_update_does_not_block_independent_resources(functions, monkey
 def test_missing_resource_keeps_not_found_response(functions, operation):
     assert _update(operation, "stale", name="missing")[0] == 404
     assert _lambda_mod._update_alias("revision-test", "missing", {"RevisionId": "stale"})[0] == 404
+
+
+def test_public_layer_accounts_resolve_vendor_layers(monkeypatch):
+    """Layers from LAMBDA_PUBLIC_LAYER_ACCOUNTS resolve without content; other unknown accounts stay denied."""
+    region = _svc.get_region()
+    arn = f"arn:aws:lambda:{region}:464622532012:layer:Datadog-Extension-ARM:97"
+    monkeypatch.setattr(_svc, "LAMBDA_PUBLIC_LAYER_ACCOUNTS", frozenset())
+    _, err = _svc._resolve_layer_version_for_attachment(arn)
+    assert err is not None and err[0] == 403
+    monkeypatch.setattr(_svc, "LAMBDA_PUBLIC_LAYER_ACCOUNTS", frozenset({"464622532012"}))
+    resolved, err = _svc._resolve_layer_version_for_attachment(arn)
+    assert err is None
+    assert resolved["LayerVersionArn"] == arn
+    assert resolved["Version"] == 97
+    assert resolved["Content"]["CodeSize"] == 0
+    other = f"arn:aws:lambda:{region}:111111111111:layer:Other:1"
+    _, err = _svc._resolve_layer_version_for_attachment(other)
+    assert err is not None
