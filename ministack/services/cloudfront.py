@@ -431,7 +431,7 @@ def _unwrap_distribution_create_xml(root_el):
 
 
 def _ingest_distribution_tags_from_xml(dist_arn: str, tags_el):
-    """Apply tag Items from CreateDistributionWithTags onto ``_tags``."""
+    """Apply tag Items from CreateDistributionWithTags (or CreateFunction) onto ``_tags``."""
     if tags_el is None:
         return
     items_el = _find(tags_el, "Items") or tags_el
@@ -822,6 +822,8 @@ def _cf_create_function(headers, body):
         "live_body": None,
     }
     _functions[name] = fn
+    # CreateFunction carries Tags in the request body, like CreateDistributionWithTags.
+    _ingest_distribution_tags_from_xml(fn["arn"], _find(el, "Tags"))
     logger.info("CreateFunction name=%s", name)
 
     return _xml_response(
@@ -994,6 +996,7 @@ def _cf_delete_function(name: str, headers):
         )
 
     del _functions[name]
+    _tags.pop(fn["arn"], None)
     logger.info("DeleteFunction name=%s", name)
     return 204, {}, b""
 

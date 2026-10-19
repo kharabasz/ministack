@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CloudFront / CloudWatch — tags on create** — `CreateFunction` ignored its `Tags` and `PutMetricAlarm` ignored `Tags` on creation; both are stored now. `DescribeAlarms` no longer invents `DatapointsToAlarm` from `EvaluationPeriods` when the alarm does not set it.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

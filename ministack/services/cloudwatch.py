@@ -985,10 +985,7 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "ExtendedStatistic": cbor_data.get("ExtendedStatistic"),
             "Period": int(cbor_data.get("Period", 60)),
             "EvaluationPeriods": int(cbor_data.get("EvaluationPeriods", 1)),
-            "DatapointsToAlarm": int(
-                cbor_data.get("DatapointsToAlarm")
-                or cbor_data.get("EvaluationPeriods", 1)
-            ),
+            "DatapointsToAlarm": cbor_data.get("DatapointsToAlarm"),
             "Threshold": float(cbor_data.get("Threshold", 0)),
             "ComparisonOperator": cbor_data.get("ComparisonOperator"),
             "TreatMissingData": cbor_data.get("TreatMissingData", "missing"),
@@ -1041,11 +1038,7 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "ExtendedStatistic": _p(params, "ExtendedStatistic") or None,
             "Period": int(_p(params, "Period") or "60"),
             "EvaluationPeriods": int(_p(params, "EvaluationPeriods") or "1"),
-            "DatapointsToAlarm": int(
-                _p(params, "DatapointsToAlarm")
-                or _p(params, "EvaluationPeriods")
-                or "1"
-            ),
+            "DatapointsToAlarm": _p(params, "DatapointsToAlarm"),
             "Threshold": float(_p(params, "Threshold") or "0"),
             "ComparisonOperator": _p(params, "ComparisonOperator"),
             "TreatMissingData": _p(params, "TreatMissingData") or "missing",
@@ -1067,8 +1060,26 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "AlarmConfigurationUpdatedTimestamp": int(time.time()),
         }
 
+    # AWS returns DatapointsToAlarm only when the alarm sets it.
+    if alarm.get("DatapointsToAlarm"):
+        alarm["DatapointsToAlarm"] = int(alarm["DatapointsToAlarm"])
+    else:
+        alarm.pop("DatapointsToAlarm", None)
+
     is_new = name not in _alarms
     _alarms[name] = alarm
+    # Tags apply on creation only; AWS ignores them when updating an alarm.
+    if is_new:
+        if is_cbor or is_json:
+            create_tags = cbor_data.get("Tags") or []
+        else:
+            create_tags, ti = [], 1
+            while _p(params, f"Tags.member.{ti}.Key"):
+                create_tags.append({"Key": _p(params, f"Tags.member.{ti}.Key"),
+                                    "Value": _p(params, f"Tags.member.{ti}.Value")})
+                ti += 1
+        if create_tags:
+            _resource_tags[alarm["AlarmArn"]] = {t["Key"]: t.get("Value", "") for t in create_tags}
 
     if is_new:
         _record_history(
