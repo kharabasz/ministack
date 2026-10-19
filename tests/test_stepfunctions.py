@@ -9276,3 +9276,24 @@ def test_sdk_lambda_get_function_missing_function_exact_catch(sfn):
                       "Lambda.ResourceNotFoundException")
     assert result["status"] == "SUCCEEDED", result
     assert json.loads(result["output"])["caught"]["Error"] == "Lambda.ResourceNotFoundException"
+
+
+def test_sfn_encryption_configuration_round_trips(sfn):
+    """encryptionConfiguration is stored, defaults to AWS_OWNED_KEY and survives updates."""
+    import json as _json
+    import uuid as _uuid
+    definition = _json.dumps({"StartAt": "Done", "States": {"Done": {"Type": "Succeed"}}})
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    plain = sfn.create_state_machine(name=f"enc-default-{_uuid.uuid4().hex[:6]}", definition=definition, roleArn=role)
+    assert sfn.describe_state_machine(stateMachineArn=plain["stateMachineArn"])["encryptionConfiguration"] == {
+        "type": "AWS_OWNED_KEY"}
+    key = "arn:aws:kms:us-east-1:000000000000:key/sfn-key"
+    cfg = {"type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key, "kmsDataKeyReusePeriodSeconds": 300}
+    arn = sfn.create_state_machine(
+        name=f"enc-cmk-{_uuid.uuid4().hex[:6]}", definition=definition, roleArn=role,
+        encryptionConfiguration=cfg)["stateMachineArn"]
+    assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == cfg
+    sfn.update_state_machine(stateMachineArn=arn, encryptionConfiguration={"type": "AWS_OWNED_KEY"})
+    assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == {"type": "AWS_OWNED_KEY"}
+    sfn.delete_state_machine(stateMachineArn=arn)
+    sfn.delete_state_machine(stateMachineArn=plain["stateMachineArn"])
