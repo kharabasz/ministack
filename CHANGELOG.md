@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **Route 53 — VPC associations for private hosted zones** — `AssociateVPCWithHostedZone`, `DisassociateVPCFromHostedZone` and `ListHostedZonesByVPC` (paged with `MaxItems` and `NextToken`). They refuse a public zone (`PublicZoneVPCAssociation`), a VPC already associated with a zone of the same name (`ConflictingDomainExists`), a VPC the zone doesn't have (404 `VPCAssociationNotFound`) and the zone's last VPC (`LastVPCAssociation`). Contributed by @kharabasz.
+- **CloudFront — VPC origins** — `CreateVpcOrigin`, `GetVpcOrigin`, `UpdateVpcOrigin`, `DeleteVpcOrigin` and `ListVpcOrigins` replace the empty `ListVpcOrigins` stub, so Terraform's `aws_cloudfront_vpc_origin` and a distribution's `vpc_origin_config` apply. An origin is `Deployed` as soon as it is created; updates and deletes need the current `If-Match`, a second origin for the same load balancer or instance answers `EntityAlreadyExists`, and deleting one that a distribution still names answers `CannotDeleteEntityWhileInUse`. Viewer requests are not routed to the VPC endpoint. Contributed by @kharabasz.
 
 ### Fixed
 - **Route 53 — private hosted zones keep their VPC** — `CreateHostedZone` with a `VPC` made a public zone and dropped the VPC, so Terraform's `aws_route53_zone` with a `vpc` block planned to add it again on every run; the zone is now private, the response carries the `VPC` instead of a delegation set, also on a `CallerReference` replay, and `GetHostedZone` returns its `VPCs`. Contributed by @kharabasz.
