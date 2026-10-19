@@ -927,7 +927,7 @@ When Docker is available, `StartApplication` for a `FLINK-1_19` or `FLINK-1_20` 
 | `MINISTACK_OPENSEARCH_ENDPOINT` | _(unset)_ | If set (e.g. `localhost:9200`), every domain returns this endpoint instead of spawning a per-domain container — useful when you bring your own cluster |
 | `PERSIST_STATE` | `0` | Set `1` to persist service state across restarts |
 | `STATE_DIR` | `/tmp/ministack-state` | Directory for persisted state files |
-| `LAMBDA_EXECUTOR` | `local` | Lambda execution mode: `local` (subprocess, including `provided.*`) or `docker` (container). `PackageType: Image` always uses Docker |
+| `LAMBDA_EXECUTOR` | `local` | Lambda execution mode: `local` (subprocess, including `provided.*`) or `docker` (container). `PackageType: Image` and the `java*`, `dotnet*` and `ruby*` runtimes always use Docker |
 | `LAMBDA_STRICT` | `0` | Set `1` for AWS-fidelity mode: every Lambda invocation runs in a Docker container via the AWS RIE image; in-process fallbacks are disabled. Missing Docker surfaces as `Runtime.DockerUnavailable` instead of degrading to a subprocess. Opt-in because the default install doesn't require Docker |
 | `LAMBDA_DOCKER_NETWORK` | _(unset)_ | Legacy alias for `DOCKER_NETWORK` (Lambda only). Prefer `DOCKER_NETWORK` which covers all services |
 | `LAMBDA_DOCKER_FLAGS` | _(unset)_ | Extra `docker run` flags injected into Lambda containers (matches LocalStack). Supports `-e` / `-v` / `--dns` / `--network` / `--cap-add` / `-m` / `--shm-size` / `--tmpfs` / `--add-host` / `--security-opt` / `--privileged` / `--read-only`. Useful for TLS proxies, custom CAs, and routed dev networks |
@@ -1055,7 +1055,7 @@ docker run -p 4566:4566 \
 
 ### Lambda in Docker
 
-Set `LAMBDA_EXECUTOR=docker` to run every Lambda invocation inside an AWS-supplied runtime container instead of a local subprocess. `PackageType: Image` always uses Docker regardless of this setting. With the default local executor, `provided.*` runs the deployment's `bootstrap` directly; the executable must be compatible with the MiniStack host's OS and architecture. Use the Docker executor for bootstraps that require the AWS runtime image.
+Set `LAMBDA_EXECUTOR=docker` to run every Lambda invocation inside an AWS-supplied runtime container instead of a local subprocess. `PackageType: Image` always uses Docker regardless of this setting, and so do `java*`, `dotnet*` and `ruby*` zip functions, which MiniStack can't run in-process. Without Docker access, such a zip function's invoke returns status 200 with the body `{"statusCode": 200, "body": "Mock response - <runtime> not supported for local execution"}` instead of running your handler; set `LAMBDA_STRICT=1` to get a function error instead (`Runtime.DockerUnavailable` without the Docker SDK, `Runtime.DockerError` when the daemon is unreachable). With the default local executor, `provided.*` runs the deployment's `bootstrap` directly; the executable must be compatible with the MiniStack host's OS and architecture. Use the Docker executor for bootstraps that require the AWS runtime image.
 
 Supported runtimes and the AWS public ECR images MiniStack pulls for them:
 
@@ -1063,9 +1063,14 @@ Supported runtimes and the AWS public ECR images MiniStack pulls for them:
 |---------|-------|
 | `python3.8` – `python3.14` | `public.ecr.aws/lambda/python:<version>` |
 | `nodejs14.x` – `nodejs24.x` | `public.ecr.aws/lambda/nodejs:<version>` |
+| `java8.al2`, `java11`, `java17`, `java21`, `java25` | `public.ecr.aws/lambda/java:<version>` |
+| `dotnet6`, `dotnet8`, `dotnet10` | `public.ecr.aws/lambda/dotnet:<version>` |
+| `ruby3.2`, `ruby3.3`, `ruby3.4`, `ruby4.0` | `public.ecr.aws/lambda/ruby:<version>` |
 | `provided.al2023` | `public.ecr.aws/lambda/provided:al2023` |
 | `provided.al2` | `public.ecr.aws/lambda/provided:al2` |
 | `provided` | `public.ecr.aws/lambda/provided:latest` |
+
+A .NET zip runs in the AWS base image, so it must be packaged as for AWS: the compiled assembly with its `<Assembly>.deps.json` and `<Assembly>.runtimeconfig.json`, which `dotnet lambda package` produces; a class library built with plain `dotnet publish` needs `<GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>` in its project file. Without `runtimeconfig.json` the runtime fails before it calls your handler.
 
 Containers are named `lambda-<random-hex-16>` and pooled across invocations. Idle containers are reaped after `LAMBDA_WARM_TTL_SECONDS` (default 300s) — no manual cleanup needed. The pool is also drained on `/_ministack/reset`.
 
