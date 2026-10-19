@@ -293,6 +293,12 @@ def _rest_api_view(api):
     if api is None:
         return api
     view = dict(api)
+    # Records persisted before these fields were stored.
+    view.setdefault("apiStatus", "AVAILABLE")
+    if "rootResourceId" not in view:
+        root = next((r for r in _resources.get(api["id"], {}).values() if r.get("path") == "/"), None)
+        if root:
+            view["rootResourceId"] = root["id"]
     if "policy" in view:
         view["policy"] = _encode_rest_api_policy(view["policy"])
     return view
@@ -3631,6 +3637,8 @@ def _create_rest_api(data):
         "policy": data.get("policy"),
         "tags": data.get("tags", {}),
         "disableExecuteApiEndpoint": data.get("disableExecuteApiEndpoint", False),
+        # Terraform AWS provider 6.x waits for apiStatus AVAILABLE after create.
+        "apiStatus": "AVAILABLE",
     }
     _rest_apis[api_id] = api
     _resources[api_id] = {}
@@ -3651,6 +3659,7 @@ def _create_rest_api(data):
         "resourceMethods": {},
     }
     _resources[api_id][root_id] = root_resource
+    api["rootResourceId"] = root_id
 
     _v1_tags[_rest_api_arn(api_id)] = dict(data.get("tags", {}))
     return _v1_response(_rest_api_view(api), 201)

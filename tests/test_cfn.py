@@ -16435,9 +16435,12 @@ def test_cfn_restapi_openapi_body_petstore(cfn, apigw_v1):
     api = apigw_v1.get_rest_api(restApiId=api_id)
     assert api["name"] == stack
     assert api["version"] == "1.0"
+    assert api["apiStatus"] == "AVAILABLE"
 
     rmap = {}
     for r in apigw_v1.get_resources(restApiId=api_id, limit=500)["items"]:
+        if r["path"] == "/":
+            assert api["rootResourceId"] == r["id"]
         rmap[r["path"]] = {
             m: apigw_v1.get_integration(restApiId=api_id, resourceId=r["id"],
                                         httpMethod=m)

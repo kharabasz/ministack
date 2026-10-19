@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **S3 upload errors under `AUTH=true`** — ordinary header-signed `PutObject` requests now check invalid bucket names, regional endpoint routing and signing regions before credentials, and missing buckets after authentication, matching observed AWS error precedence. The six upload errors include AWS's fixed messages, XML detail fields and matching request identifiers. Pre-authentication regional endpoint checks use `s3.<region>.<host>` hosts. Reserved root credentials and `AUTH=false` keep their existing authentication behavior; bucket home-region checks still apply.
+- **API Gateway — REST API `apiStatus` and `rootResourceId`** — REST APIs had neither field, so Terraform AWS provider 6.x timed out after `CreateRestApi` waiting for `apiStatus` `AVAILABLE`; `CreateRestApi`, `GetRestApi`, `GetRestApis` and `UpdateRestApi` now return `apiStatus` `AVAILABLE` and the `/` resource's id as `rootResourceId`, as do CloudFormation REST APIs created from a `Body` and REST APIs restored from earlier persisted state. Contributed by @kharabasz.
 
 ## [1.5.29] — 2026-10-17
 
