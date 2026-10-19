@@ -573,6 +573,36 @@ def test_verified_access_describe_filters_and_pagination(ec2):
         ec2.delete_verified_access_instance(VerifiedAccessInstanceId=inst_id)
 
 
+def test_verified_access_max_results_bounds_follow_each_operation(ec2):
+    # botocore model: groups and endpoints 5-1000, logging configurations 1-10.
+    inst_a, inst_b = _instance(ec2), _instance(ec2)
+    group_id = _group(ec2, inst_a)
+    groups = ec2.describe_verified_access_groups(
+        VerifiedAccessGroupIds=[group_id], MaxResults=500)["VerifiedAccessGroups"]
+    assert [g["VerifiedAccessGroupId"] for g in groups] == [group_id]
+    ec2.describe_verified_access_endpoints(MaxResults=1000)
+
+    first = ec2.describe_verified_access_instance_logging_configurations(
+        VerifiedAccessInstanceIds=[inst_a, inst_b], MaxResults=1)
+    assert len(first["LoggingConfigurations"]) == 1
+    second = ec2.describe_verified_access_instance_logging_configurations(
+        VerifiedAccessInstanceIds=[inst_a, inst_b], MaxResults=1, NextToken=first["NextToken"])
+    assert len(second["LoggingConfigurations"]) == 1
+    assert "NextToken" not in second
+    assert {c["VerifiedAccessInstanceId"]
+            for c in first["LoggingConfigurations"] + second["LoggingConfigurations"]} == {inst_a, inst_b}
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_verified_access_instance_logging_configurations(MaxResults=50)
+    assert _error_code(exc) == "InvalidParameterValue"
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_verified_access_instances(MaxResults=500)
+    assert _error_code(exc) == "InvalidParameterValue"
+
+    ec2.delete_verified_access_group(VerifiedAccessGroupId=group_id)
+    for inst_id in (inst_a, inst_b):
+        ec2.delete_verified_access_instance(VerifiedAccessInstanceId=inst_id)
+
+
 def test_verified_access_resources_are_regional():
     east, west = _client("us-east-1"), _client("eu-west-1")
     inst_id = _instance(east)

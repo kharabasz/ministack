@@ -7358,13 +7358,14 @@ def _va_indexed(p, prefix):
     return sorted(indexes)
 
 
-def _va_select(p, records, id_key, ids):
+def _va_select(p, records, id_key, ids, bounds=(5, 200)):
     """Apply the shared Describe* request members to a list of records.
 
     ``ids`` must already be checked to exist. Filters support ``tag:<key>``,
     ``tag-key`` and ``tag-value`` (the EC2-wide tag filters); any other
     filter name is refused with InvalidParameterValue. MaxResults/NextToken
-    page through the records in creation order.
+    page through the records in creation order; ``bounds`` is the
+    operation's (min, max) MaxResults range from the botocore model.
     Returns (selected_records, next_token, error_response).
     """
     filters = _parse_filters(p)
@@ -7383,8 +7384,9 @@ def _va_select(p, records, id_key, ids):
         start = int(token)
     max_results = _p(p, "MaxResults")
     if max_results:
-        if not max_results.isdigit() or not 5 <= int(max_results) <= 200:
-            return None, None, _va_invalid("MaxResults must be between 5 and 200")
+        low, high = bounds
+        if not max_results.isdigit() or not low <= int(max_results) <= high:
+            return None, None, _va_invalid(f"MaxResults must be between {low} and {high}")
         end = start + int(max_results)
         next_token = str(end) if end < len(selected) else ""
         return selected[start:end], next_token, None
@@ -7736,7 +7738,8 @@ def _describe_verified_access_instance_logging_configurations(p):
     for inst_id in ids:
         if inst_id not in _va_instances:
             return _va_not_found("Instance", inst_id)
-    selected, token, err = _va_select(p, list(_va_instances.values()), "VerifiedAccessInstanceId", ids)
+    selected, token, err = _va_select(
+        p, list(_va_instances.values()), "VerifiedAccessInstanceId", ids, bounds=(1, 10))
     if err:
         return err
     items = "".join(_va_logging_xml(inst, tag="item") for inst in selected)
@@ -7796,7 +7799,7 @@ def _describe_verified_access_groups(p):
         if group_id not in _va_groups:
             return _va_not_found("Group", group_id)
     records = [g for g in _va_groups.values() if not inst_id or g["VerifiedAccessInstanceId"] == inst_id]
-    selected, token, err = _va_select(p, records, "VerifiedAccessGroupId", ids)
+    selected, token, err = _va_select(p, records, "VerifiedAccessGroupId", ids, bounds=(5, 1000))
     if err:
         return err
     items = "".join(_va_group_xml(group, tag="item") for group in selected)
@@ -8025,7 +8028,7 @@ def _describe_verified_access_endpoints(p):
         if (not group_id or ep["VerifiedAccessGroupId"] == group_id)
         and (not inst_id or ep["VerifiedAccessInstanceId"] == inst_id)
     ]
-    selected, token, err = _va_select(p, records, "VerifiedAccessEndpointId", ids)
+    selected, token, err = _va_select(p, records, "VerifiedAccessEndpointId", ids, bounds=(5, 1000))
     if err:
         return err
     items = "".join(_va_endpoint_xml(ep, tag="item") for ep in selected)
