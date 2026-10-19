@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **EventBridge Schemas — registries and schemas** — new `schemas` service for Terraform's `aws_schemas_registry` and `aws_schemas_schema`: registries and versioned `OpenApi3` / `JSONSchemaDraft4` schemas (create, describe, describe a version, update, delete, list, list versions) and tags, per account and region. `UpdateSchema` adds a version when the content or type changes, deleting a registry deletes its schemas, list calls take name prefixes and `Limit`/`NextToken`, and requests map to `schemas:*` IAM actions under `AUTH=true`. No discovery, code bindings, resource policies or search. Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
