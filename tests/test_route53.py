@@ -686,3 +686,53 @@ def test_unicode_route53_zone_comment(r53):
     zone_id = resp["HostedZone"]["Id"].split("/")[-1]
     get = r53.get_hosted_zone(Id=zone_id)
     assert get["HostedZone"]["Config"]["Comment"] == "zona en español — Ünïcödé"
+
+
+def test_route53_private_zone_keeps_vpc_associations(r53):
+    """CreateHostedZone with a VPC makes a private zone; GetHostedZone returns its VPCs."""
+    import uuid as _uuid
+
+    vpc = {"VPCRegion": "us-east-1", "VPCId": "vpc-0123456789abcdef0"}
+    created = r53.create_hosted_zone(
+        Name="private-assoc.example.com", CallerReference=str(_uuid.uuid4()), VPC=vpc)
+    zone_id = created["HostedZone"]["Id"].split("/")[-1]
+    assert created["HostedZone"]["Config"]["PrivateZone"] is True
+    assert created["VPC"] == vpc
+    assert "DelegationSet" not in created
+
+    got = r53.get_hosted_zone(Id=zone_id)
+    assert got["HostedZone"]["Config"]["PrivateZone"] is True
+    assert got["VPCs"] == [vpc]
+
+    second = {"VPCRegion": "us-west-2", "VPCId": "vpc-0fedcba9876543210"}
+    r53.associate_vpc_with_hosted_zone(HostedZoneId=zone_id, VPC=second)
+    assert r53.get_hosted_zone(Id=zone_id)["VPCs"] == [vpc, second]
+    with pytest.raises(ClientError) as exc:
+        r53.associate_vpc_with_hosted_zone(HostedZoneId=zone_id, VPC=second)
+    assert exc.value.response["Error"]["Code"] == "ConflictingDomainExists"
+
+    by_vpc = r53.list_hosted_zones_by_vpc(VPCId=second["VPCId"], VPCRegion=second["VPCRegion"])
+    assert [s["HostedZoneId"] for s in by_vpc["HostedZoneSummaries"]] == [zone_id]
+
+    r53.disassociate_vpc_from_hosted_zone(HostedZoneId=zone_id, VPC=second)
+    assert r53.get_hosted_zone(Id=zone_id)["VPCs"] == [vpc]
+    with pytest.raises(ClientError) as exc:
+        r53.disassociate_vpc_from_hosted_zone(HostedZoneId=zone_id, VPC=vpc)
+    assert exc.value.response["Error"]["Code"] == "LastVPCAssociation"
+    with pytest.raises(ClientError) as exc:
+        r53.disassociate_vpc_from_hosted_zone(HostedZoneId=zone_id, VPC=second)
+    assert exc.value.response["Error"]["Code"] == "VPCAssociationNotFound"
+    r53.delete_hosted_zone(Id=zone_id)
+
+
+def test_route53_public_zone_refuses_vpc_association(r53):
+    import uuid as _uuid
+
+    zone_id = r53.create_hosted_zone(
+        Name="public-assoc.example.com", CallerReference=str(_uuid.uuid4()))["HostedZone"]["Id"].split("/")[-1]
+    assert "VPCs" not in r53.get_hosted_zone(Id=zone_id)
+    with pytest.raises(ClientError) as exc:
+        r53.associate_vpc_with_hosted_zone(
+            HostedZoneId=zone_id, VPC={"VPCRegion": "us-east-1", "VPCId": "vpc-0123456789abcdef0"})
+    assert exc.value.response["Error"]["Code"] == "PublicZoneVPCAssociation"
+    r53.delete_hosted_zone(Id=zone_id)
