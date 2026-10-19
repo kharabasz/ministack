@@ -312,6 +312,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **IAM — trust policies with `NotPrincipal`** — `CreateRole`, `UpdateAssumeRolePolicy` and `AWS::IAM::Role` stored them; they now answer `MalformedPolicyDocument` (`Allow with NotPrincipal is not allowed.`, `AssumeRole policy must not contain NotPrincipal field.`). Contributed by @iot-rocket.
 - **CloudTrail — `RecursiveLogging` on trails** — `CreateTrail` and `UpdateTrail` ignored it; trails now store it (default `true`, kept by an `UpdateTrail` without it) and return it from every trail response. Contributed by @iot-rocket.
 - **CloudFormation — callback URLs under `USE_SSL=1`** — the custom resource `ResponseURL` and the `WaitConditionHandle` URL were always `http://`, which the TLS-only gateway drops, so a handler's `urllib` PUT never arrived and the stack waited out `ServiceTimeout`; both are now `https://` when `USE_SSL` is on, and MiniStack's Lambdas get `SSL_CERT_FILE` set to the gateway's CA bundle, which Python's `ssl` reads. Contributed by @iot-rocket.
+### Added
+- **VPC Lattice — service network control plane** — new `vpc-lattice` service: service networks (create, get by ID, ARN or name, update `authType`, delete, list), VPC associations (`ACTIVE` on create, `DELETE_IN_PROGRESS` on delete), auth policies (`Active` only when the network's auth type is `AWS_IAM`), access log subscriptions to S3, CloudWatch Logs or Firehose, and tags, per account and region. Duplicate names, duplicate VPC associations, a second subscription to the same destination type, and deleting a network that still has VPC associations answer `ConflictException`; unknown identifiers answer `ResourceNotFoundException`. No services, target groups, listeners or routing.
 
 ## [1.5.29] — 2026-10-17
 
