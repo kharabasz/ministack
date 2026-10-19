@@ -302,9 +302,13 @@ def _put_scaling_policy(data):
     target = _targets.get(_target_key(data))
     if not target:
         return _target_missing(data)
-    # Inference: an omitted PolicyType is a step scaling policy, as in the
-    # Terraform provider's default.
-    policy_type = data.get("PolicyType") or "StepScaling"
+    key = f"{_target_key(data)}|{data['PolicyName']}"
+    existing = _policies.get(key)
+    # Model docs: PolicyType is required when creating a policy; an update
+    # that omits it keeps the policy's type.
+    policy_type = data.get("PolicyType") or (existing or {}).get("PolicyType")
+    if not policy_type:
+        return _validation("PolicyType is required when creating a scaling policy")
     if policy_type not in _MODEL_POLICY_TYPES:
         return _validation(
             f"1 validation error detected: Value '{policy_type}' at 'policyType' failed to satisfy constraint: "
@@ -317,8 +321,6 @@ def _put_scaling_policy(data):
         return _validation(f"{config_key} is required for a {policy_type} policy")
     if policy_type == "TargetTrackingScaling" and not isinstance(config.get("TargetValue"), (int, float)):
         return _null_error("TargetValue")
-    key = f"{_target_key(data)}|{data['PolicyName']}"
-    existing = _policies.get(key)
     policy = {
         "PolicyARN": existing["PolicyARN"] if existing else _child_arn(
             target, "scalingPolicy", "policyName", data["PolicyName"]),
