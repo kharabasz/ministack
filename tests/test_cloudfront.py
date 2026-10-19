@@ -3078,3 +3078,37 @@ def test_cloudfront_create_function_keeps_tags(cloudfront):
     arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
     assert cloudfront.list_tags_for_resource(Resource=arn)["Tags"]["Items"] == [{"Key": "environment", "Value": "dev"}]
     cloudfront.delete_function(Name="tagged-fn", IfMatch=fn["ETag"])
+def test_cloudfront_vpc_origin_lifecycle_and_distribution_reference(cloudfront):
+    """VPC origins are created Deployed, updated with If-Match, referenced by a distribution and protected while in use."""
+    import uuid as _uuid
+    lb = "arn:aws:elasticloadbalancing:us-east-2:000000000000:loadbalancer/app/api/0123456789abcdef"
+    cfg = {"Name": "api", "Arn": lb, "HTTPPort": 80, "HTTPSPort": 443, "OriginProtocolPolicy": "https-only",
+           "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]}}
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=cfg, Tags={"Items": [{"Key": "team", "Value": "platform"}]})
+    vo = created["VpcOrigin"]
+    assert vo["Id"].startswith("vo_") and vo["Status"] == "Deployed"
+    assert vo["VpcOriginEndpointConfig"]["Arn"] == lb
+    assert cloudfront.list_tags_for_resource(Resource=vo["Arn"])["Tags"]["Items"] == [{"Key": "team", "Value": "platform"}]
+    got = cloudfront.get_vpc_origin(Id=vo["Id"])
+    assert got["VpcOrigin"]["VpcOriginEndpointConfig"]["OriginSslProtocols"]["Items"] == ["TLSv1.2"]
+    updated = cloudfront.update_vpc_origin(Id=vo["Id"], IfMatch=got["ETag"],
+                                           VpcOriginEndpointConfig={**cfg, "HTTPSPort": 8443})
+    assert updated["VpcOrigin"]["VpcOriginEndpointConfig"]["HTTPSPort"] == 8443
+    assert [s["Id"] for s in cloudfront.list_vpc_origins()["VpcOriginList"]["Items"]] == [vo["Id"]]
+
+    dist = cloudfront.create_distribution(DistributionConfig={
+        "CallerReference": str(_uuid.uuid4()), "Comment": "", "Enabled": True,
+        "Origins": {"Quantity": 1, "Items": [{"Id": "api", "DomainName": "api.internal.example.com",
+                                              "VpcOriginConfig": {"VpcOriginId": vo["Id"]}}]},
+        "DefaultCacheBehavior": {"TargetOriginId": "api", "ViewerProtocolPolicy": "https-only",
+                                 "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"},
+    })["Distribution"]
+    origin = cloudfront.get_distribution(Id=dist["Id"])["Distribution"]["DistributionConfig"]["Origins"]["Items"][0]
+    assert origin["VpcOriginConfig"]["VpcOriginId"] == vo["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_vpc_origin(Id=vo["Id"], IfMatch=updated["ETag"])
+    assert exc.value.response["Error"]["Code"] == "CannotDeleteEntityWhileInUse"
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_vpc_origin(Id=vo["Id"], IfMatch="stale")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"

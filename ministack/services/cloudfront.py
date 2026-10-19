@@ -89,6 +89,9 @@ _OAC_RE = re.compile(r"^/2020-05-31/origin-access-control/?$")
 _OAC_CFG_RE = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/config$")
 _OAC_ID_RE = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/?$")
 
+_VPC_ORIGIN_RE = re.compile(r"^/2020-05-31/vpc-origin/?$")
+_VPC_ORIGIN_ID_RE = re.compile(r"^/2020-05-31/vpc-origin/([^/]+)/?$")
+
 _FUN_LIST_RE = re.compile(r"^/2020-05-31/function/?$")
 _FUN_DESCRIBE_RE = re.compile(r"^/2020-05-31/function/([^/]+)/describe/?$")
 _FUN_PUBLISH_RE = re.compile(r"^/2020-05-31/function/([^/]+)/publish/?$")
@@ -176,6 +179,7 @@ _key_groups = AccountScopedDict()  # Id -> key group record
 _connection_groups = AccountScopedDict()  # Id -> connection group record (SaaS Manager)
 _distribution_tenants = AccountScopedDict()  # Id -> distribution tenant record (SaaS Manager)
 _tenant_invalidations = AccountScopedDict()  # tenant_id -> [invalidation record, ...]
+_vpc_origins = AccountScopedDict()  # Id -> VPC origin record
 
 
 def reset():
@@ -193,6 +197,7 @@ def reset():
     _connection_groups.clear()
     _distribution_tenants.clear()
     _tenant_invalidations.clear()
+    _vpc_origins.clear()
     # Drop the JS workers so their compiled-function cache does not outlive a
     # reset (mirrors appsync.reset()'s appsync_js.reset()).
     from ministack.core import cloudfront_js
@@ -216,6 +221,7 @@ def get_state():
             "connection_groups": _connection_groups,
             "distribution_tenants": _distribution_tenants,
             "tenant_invalidations": _tenant_invalidations,
+            "vpc_origins": _vpc_origins,
         }
     )
 
@@ -238,6 +244,7 @@ def _restore_state(data):
     _key_groups.update(data.get("key_groups", {}))
     _connection_groups.update(data.get("connection_groups", {}))
     _distribution_tenants.update(data.get("distribution_tenants", {}))
+    _vpc_origins.update(data.get("vpc_origins", {}))
     _tenant_invalidations.update(data.get("tenant_invalidations", {}))
 
 
@@ -684,6 +691,7 @@ def _resolve_taggable_cloudfront_arn(arn: str):
         "key-value-store": (_kvstores, "EntityNotFound", f"The key value store {name} was not found.", "ARN"),
         "distribution-tenant": (_distribution_tenants, "EntityNotFound", "The distribution tenant was not found.", "Arn"),
         "connection-group": (_connection_groups, "EntityNotFound", "The connection group was not found.", "Arn"),
+        "vpcorigin": (_vpc_origins, "EntityNotFound", "The VPC origin was not found.", "Arn"),
     }
     entry = resources.get(resource_type)
     if not entry:
@@ -2449,6 +2457,21 @@ async def handle_request(method, path, headers, body, query_params):
             return _untag_resource(resource, body)
 
     # OAC routes
+    m = _VPC_ORIGIN_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_vpc_origin(body)
+        if method == "GET":
+            return _list_vpc_origins()
+    m = _VPC_ORIGIN_ID_RE.match(path)
+    if m:
+        if method == "GET":
+            return _get_vpc_origin(m.group(1))
+        if method == "PUT":
+            return _update_vpc_origin(m.group(1), headers, body)
+        if method == "DELETE":
+            return _delete_vpc_origin(m.group(1), headers)
+
     m = _OAC_RE.match(path)
     if m:
         if method == "POST":
@@ -3189,6 +3212,169 @@ def _untag_resource(resource_arn, body):
 # ---------------------------------------------------------------------------
 # OAC handlers
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# VPC origins
+# ---------------------------------------------------------------------------
+# Control plane only: VPC origins are Deployed as soon as they are created, and
+# distributions keep their VpcOriginConfig in the stored config XML.
+
+_VPC_ORIGIN_PROTOCOL_POLICIES = ("http-only", "match-viewer", "https-only")
+
+
+def _parse_vpc_origin_endpoint_config(el):
+    cfg_el = _find(el, "VpcOriginEndpointConfig") if _local_tag_name(el) != "VpcOriginEndpointConfig" else el
+    if cfg_el is None:
+        return None, _error("InvalidArgument", "VpcOriginEndpointConfig is required.", 400)
+    cfg = {
+        "Name": _text(cfg_el, "Name"),
+        "Arn": _text(cfg_el, "Arn"),
+        "HTTPPort": int(_text(cfg_el, "HTTPPort") or "80"),
+        "HTTPSPort": int(_text(cfg_el, "HTTPSPort") or "443"),
+        "OriginProtocolPolicy": _text(cfg_el, "OriginProtocolPolicy"),
+    }
+    if not cfg["Name"] or not cfg["Arn"]:
+        return None, _error("InvalidArgument", "VpcOriginEndpointConfig needs Name and Arn.", 400)
+    if cfg["OriginProtocolPolicy"] not in _VPC_ORIGIN_PROTOCOL_POLICIES:
+        return None, _error("InvalidArgument", "OriginProtocolPolicy must be http-only, match-viewer or https-only.", 400)
+    ssl_el = _find(cfg_el, "OriginSslProtocols")
+    items_el = _find(ssl_el, "Items") if ssl_el is not None else None
+    cfg["OriginSslProtocols"] = [i.text for i in items_el] if items_el is not None else ["TLSv1.2"]
+    return cfg, None
+
+
+def _build_vpc_origin_xml(root, vo):
+    SubElement(root, "Id").text = vo["Id"]
+    SubElement(root, "Arn").text = vo["Arn"]
+    SubElement(root, "AccountId").text = vo["AccountId"]
+    SubElement(root, "Status").text = vo["Status"]
+    SubElement(root, "CreatedTime").text = vo["CreatedTime"]
+    SubElement(root, "LastModifiedTime").text = vo["LastModifiedTime"]
+    cfg = vo["VpcOriginEndpointConfig"]
+    cfg_el = SubElement(root, "VpcOriginEndpointConfig")
+    SubElement(cfg_el, "Name").text = cfg["Name"]
+    SubElement(cfg_el, "Arn").text = cfg["Arn"]
+    SubElement(cfg_el, "HTTPPort").text = str(cfg["HTTPPort"])
+    SubElement(cfg_el, "HTTPSPort").text = str(cfg["HTTPSPort"])
+    SubElement(cfg_el, "OriginProtocolPolicy").text = cfg["OriginProtocolPolicy"]
+    ssl_el = SubElement(cfg_el, "OriginSslProtocols")
+    SubElement(ssl_el, "Quantity").text = str(len(cfg["OriginSslProtocols"]))
+    items_el = SubElement(ssl_el, "Items")
+    for proto in cfg["OriginSslProtocols"]:
+        SubElement(items_el, "SslProtocol").text = proto
+
+
+def _vpc_origin_response(vo, status=200):
+    return _xml_response("VpcOrigin", lambda root: _build_vpc_origin_xml(root, vo), status=status,
+                         extra_headers={"ETag": vo["ETag"]})
+
+
+def _create_vpc_origin(body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_vpc_origin_endpoint_config(el)
+    if err:
+        return err
+    for existing in _vpc_origins.values():
+        if existing["VpcOriginEndpointConfig"]["Arn"] == cfg["Arn"]:
+            return _error("EntityAlreadyExists", "A VPC origin for this endpoint already exists.", 409)
+    vo_id = "vo_" + "".join(random.choices(_ID_CHARS, k=22))
+    now = _now_iso()
+    vo = {
+        "Id": vo_id,
+        "Arn": f"arn:aws:cloudfront::{get_account_id()}:vpcorigin/{vo_id}",
+        "AccountId": get_account_id(),
+        "Status": "Deployed",
+        "CreatedTime": now,
+        "LastModifiedTime": now,
+        "VpcOriginEndpointConfig": cfg,
+        "ETag": new_uuid(),
+    }
+    _vpc_origins[vo_id] = vo
+    _ingest_distribution_tags_from_xml(vo["Arn"], _find(el, "Tags"))
+    status, headers, payload = _vpc_origin_response(vo, status=202)
+    headers["Location"] = f"/2020-05-31/vpc-origin/{vo_id}"
+    return status, headers, payload
+
+
+def _get_vpc_origin(vo_id):
+    vo = _vpc_origins.get(vo_id)
+    if not vo:
+        return _error("EntityNotFound", "The VPC origin was not found.", 404)
+    return _vpc_origin_response(vo)
+
+
+def _vpc_origin_if_match(vo, headers):
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != vo["ETag"]:
+        return _error("PreconditionFailed",
+                      "The precondition given in one or more of the request-header fields evaluated to false.", 412)
+    return None
+
+
+def _update_vpc_origin(vo_id, headers, body):
+    vo = _vpc_origins.get(vo_id)
+    if not vo:
+        return _error("EntityNotFound", "The VPC origin was not found.", 404)
+    err = _vpc_origin_if_match(vo, headers)
+    if err:
+        return err
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_vpc_origin_endpoint_config(el)
+    if err:
+        return err
+    vo["VpcOriginEndpointConfig"] = cfg
+    vo["LastModifiedTime"] = _now_iso()
+    vo["ETag"] = new_uuid()
+    return _vpc_origin_response(vo, status=202)
+
+
+def _vpc_origin_in_use(vo_id):
+    return any(vo_id in (d.get("config_xml") or "") for d in _distributions.values())
+
+
+def _delete_vpc_origin(vo_id, headers):
+    vo = _vpc_origins.get(vo_id)
+    if not vo:
+        return _error("EntityNotFound", "The VPC origin was not found.", 404)
+    err = _vpc_origin_if_match(vo, headers)
+    if err:
+        return err
+    if _vpc_origin_in_use(vo_id):
+        return _error("CannotDeleteEntityWhileInUse", "The VPC origin is in use by a distribution.", 409)
+    del _vpc_origins[vo_id]
+    _tags.pop(vo["Arn"], None)
+    return _vpc_origin_response(dict(vo, Status="Deleting"), status=202)
+
+
+def _list_vpc_origins():
+    items = list(_vpc_origins.values())
+
+    def build(root):
+        SubElement(root, "Marker").text = ""
+        SubElement(root, "MaxItems").text = "100"
+        SubElement(root, "IsTruncated").text = "false"
+        SubElement(root, "Quantity").text = str(len(items))
+        if items:
+            items_el = SubElement(root, "Items")
+            for vo in items:
+                summary = SubElement(items_el, "VpcOriginSummary")
+                SubElement(summary, "Id").text = vo["Id"]
+                SubElement(summary, "Name").text = vo["VpcOriginEndpointConfig"]["Name"]
+                SubElement(summary, "Status").text = vo["Status"]
+                SubElement(summary, "CreatedTime").text = vo["CreatedTime"]
+                SubElement(summary, "LastModifiedTime").text = vo["LastModifiedTime"]
+                SubElement(summary, "Arn").text = vo["Arn"]
+                SubElement(summary, "AccountId").text = vo["AccountId"]
+                SubElement(summary, "OriginEndpointArn").text = vo["VpcOriginEndpointConfig"]["Arn"]
+
+    return _xml_response("VpcOriginList", build)
 
 
 def _create_oac(headers, body):
