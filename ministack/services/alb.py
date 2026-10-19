@@ -521,17 +521,66 @@ def _action_xml(a):
     return f"<member>{inner}</member>"
 
 
+# Security policy for HTTPS/TLS listeners created without one: the AWS docs
+# name ELBSecurityPolicy-2016-08 as the default for listeners created through
+# the API, CLI or CloudFormation (the console uses a newer one).
+_DEFAULT_SSL_POLICY = "ELBSecurityPolicy-2016-08"
+_SECURE_PROTOCOLS = ("HTTPS", "TLS")
+
+
 def _listener_xml(l):
     acts = "".join(_action_xml(a) for a in l.get("DefaultActions", []))
+    certs = "".join(
+        f"<member><CertificateArn>{_esc(arn)}</CertificateArn></member>"
+        for arn in l.get("Certificates", [])
+    )
+    certs_xml = f"<Certificates>{certs}</Certificates>" if certs else ""
+    policy_xml = f"<SslPolicy>{_esc(l['SslPolicy'])}</SslPolicy>" if l.get("SslPolicy") else ""
+    # Member order follows the botocore Listener shape.
     return (
         f"<member>"
         f"<ListenerArn>{l['ListenerArn']}</ListenerArn>"
         f"<LoadBalancerArn>{l['LoadBalancerArn']}</LoadBalancerArn>"
         f"<Port>{l.get('Port',80)}</Port>"
         f"<Protocol>{l.get('Protocol','HTTP')}</Protocol>"
+        f"{certs_xml}{policy_xml}"
         f"<DefaultActions>{acts}</DefaultActions>"
         f"</member>"
     )
+
+
+def _parse_certificate_arns(params, prefix="Certificates"):
+    arns, i = [], 1
+    while _p(params, f"{prefix}.member.{i}.CertificateArn"):
+        arns.append(_p(params, f"{prefix}.member.{i}.CertificateArn"))
+        i += 1
+    return arns
+
+
+def _default_certificate(params):
+    """The listener's default certificate from ``Certificates``, which takes
+    exactly one entry. Returns ``(arns, error)``."""
+    certs = _parse_certificate_arns(params)
+    if len(certs) > 1:
+        return None, _error(
+            "ValidationError",
+            "Certificates must contain exactly one default certificate.")
+    return certs, None
+
+
+def _apply_tls_settings(listener, certs, policy):
+    """Store ``SslPolicy`` and the default certificate on an HTTPS/TLS
+    listener, defaulting the policy when none is set. Any other protocol keeps
+    no TLS settings, so a listener moved to HTTP/TCP loses them."""
+    if listener.get("Protocol") not in _SECURE_PROTOCOLS:
+        listener.pop("SslPolicy", None)
+        listener.pop("Certificates", None)
+        return
+    if certs:
+        listener["Certificates"] = certs
+    if policy:
+        listener["SslPolicy"] = policy
+    listener.setdefault("SslPolicy", _DEFAULT_SSL_POLICY)
 
 
 def _condition_xml(c):
@@ -807,6 +856,9 @@ def _create_listener(params):
     lb_arn = _p(params, "LoadBalancerArn")
     if lb_arn not in _lbs:
         return _error("LoadBalancerNotFound", f"Load balancer '{lb_arn}' not found.")
+    certs, err = _default_certificate(params)
+    if err:
+        return err
     lid = _short_id()
     lb = _lbs[lb_arn]
     lb_name = lb["LoadBalancerName"]
@@ -825,6 +877,7 @@ def _create_listener(params):
         "Protocol": _p(params, "Protocol", "HTTP"),
         "DefaultActions": actions,
     }
+    _apply_tls_settings(listener, certs, _p(params, "SslPolicy"))
     _listeners[l_arn] = listener
     _listener_attrs[l_arn] = [
         {"Key": "routing.http.response.server.enabled", "Value": "true"},
@@ -859,12 +912,16 @@ def _modify_listener(params):
     listener = _listeners.get(arn)
     if not listener:
         return _error("ListenerNotFound", f"Listener '{arn}' not found.")
+    certs, err = _default_certificate(params)
+    if err:
+        return err
     port = _p(params, "Port")
     if port:
         listener["Port"] = int(port)
     protocol = _p(params, "Protocol")
     if protocol:
         listener["Protocol"] = protocol
+    _apply_tls_settings(listener, certs, _p(params, "SslPolicy"))
     actions = _parse_actions(params, "DefaultActions")
     if actions:
         listener["DefaultActions"] = actions
