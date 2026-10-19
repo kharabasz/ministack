@@ -462,6 +462,11 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/configurationsessions", "/configuration"],
         "credential_scope": "appconfigdata",
     },
+    "schemas": {
+        "host_patterns": [r"schemas\."],
+        "path_prefixes": ["/v1/registries"],
+        "credential_scope": "schemas",
+    },
     "scheduler": {
         "host_patterns": [r"scheduler\."],
         "path_prefixes": ["/schedules", "/schedule-groups"],
@@ -871,6 +876,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "appconfig": "appconfig",
                 "appconfigdata": "appconfigdata",
                 "scheduler": "scheduler",
+                "schemas": "schemas",
                 "eks": "eks",
                 # Amazon Location signs with scope `geo`, not `location`
                 # (botocore signingName). With an endpoint override the host
