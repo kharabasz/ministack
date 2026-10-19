@@ -2307,6 +2307,28 @@ class TestResourceArn:
         body = json.dumps({"resourceArn": "arn:aws:rds:us-east-1:123:cluster:my-db"}).encode()
         assert extract_resource_arn("rds-data", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:rds:us-east-1:123:cluster:my-db"
 
+    def test_vpc_lattice_resources(self):
+        from ministack.core.iam_actions import extract_resource_arn
+
+        def arn(method, path, body=b""):
+            return extract_resource_arn("vpc-lattice", method, path, {}, body, {}, "us-east-1", "123456789012")
+
+        prefix = "arn:aws:vpc-lattice:us-east-1:123456789012:"
+        sn_arn = "arn:aws:vpc-lattice:eu-west-1:210987654321:servicenetwork/sn-0123456789abcdefg"
+        assert arn("GET", "/servicenetworks/sn-0123456789abcdefg") == f"{prefix}servicenetwork/sn-0123456789abcdefg"
+        assert arn("GET", f"/servicenetworks/{sn_arn}") == sn_arn
+        assert arn("PATCH", "/servicenetworkvpcassociations/snva-0123456789abcdefg") == (
+            f"{prefix}servicenetworkvpcassociation/snva-0123456789abcdefg")
+        assert arn("DELETE", "/accesslogsubscriptions/als-0123456789abcdefg") == (
+            f"{prefix}accesslogsubscription/als-0123456789abcdefg")
+        assert arn("PUT", "/authpolicy/sn-0123456789abcdefg") == f"{prefix}servicenetwork/sn-0123456789abcdefg"
+        assert arn("GET", f"/tags/{sn_arn}") == sn_arn
+        body = json.dumps({"serviceNetworkIdentifier": "sn-0123456789abcdefg", "vpcIdentifier": "vpc-1"}).encode()
+        assert arn("POST", "/servicenetworkvpcassociations", body) == f"{prefix}servicenetwork/sn-0123456789abcdefg"
+        assert arn("POST", "/servicenetworks") == "*"
+        assert arn("GET", "/servicenetworks") == "*"
+        assert arn("POST", "/accesslogsubscriptions") == "*"
+
     def test_s3tables(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("s3tables", "GET", "/buckets/my-tb", {}, b"", {}, "us-east-1", "123") == "arn:aws:s3tables:us-east-1:123:bucket/my-tb"
@@ -2957,6 +2979,35 @@ class TestActionExtraction:
         assert extract_iam_action("lambda", "POST", path, {}, b"", {}) == "lambda:TagResource"
         assert extract_iam_action("lambda", "DELETE", path, {}, b"", {"tagKeys": ["a"]}) == "lambda:UntagResource"
         assert extract_iam_action("lambda", "GET", path, {}, b"", {}) == "lambda:ListTags"
+
+    def test_vpc_lattice_rest_actions(self):
+        """Every in-scope VPC Lattice operation resolves to its vpc-lattice:
+        action (Service Authorization Reference); an unmapped service would
+        be allowed for any caller under AUTH=true."""
+        from ministack.core.iam_actions import extract_iam_action
+        arn = "arn:aws:vpc-lattice:us-east-1:000000000000:servicenetwork/sn-0123456789abcdefg"
+
+        def act(method, path, query=None):
+            return extract_iam_action("vpc-lattice", method, path, {}, b"", query or {})
+
+        assert act("POST", "/servicenetworks") == "vpc-lattice:CreateServiceNetwork"
+        assert act("GET", "/servicenetworks") == "vpc-lattice:ListServiceNetworks"
+        assert act("GET", f"/servicenetworks/{arn}") == "vpc-lattice:GetServiceNetwork"
+        assert act("PATCH", "/servicenetworks/sn-0123456789abcdefg") == "vpc-lattice:UpdateServiceNetwork"
+        assert act("DELETE", "/servicenetworks/sn-0123456789abcdefg") == "vpc-lattice:DeleteServiceNetwork"
+        assert act("POST", "/servicenetworkvpcassociations") == "vpc-lattice:CreateServiceNetworkVpcAssociation"
+        assert act("GET", "/servicenetworkvpcassociations") == "vpc-lattice:ListServiceNetworkVpcAssociations"
+        assert act("DELETE", "/servicenetworkvpcassociations/snva-0123456789abcdefg") == (
+            "vpc-lattice:DeleteServiceNetworkVpcAssociation")
+        assert act("PUT", f"/authpolicy/{arn}") == "vpc-lattice:PutAuthPolicy"
+        assert act("GET", "/authpolicy/sn-0123456789abcdefg") == "vpc-lattice:GetAuthPolicy"
+        assert act("DELETE", "/authpolicy/sn-0123456789abcdefg") == "vpc-lattice:DeleteAuthPolicy"
+        assert act("POST", "/accesslogsubscriptions") == "vpc-lattice:CreateAccessLogSubscription"
+        assert act("PATCH", "/accesslogsubscriptions/als-0123456789abcdefg") == (
+            "vpc-lattice:UpdateAccessLogSubscription")
+        assert act("POST", f"/tags/{arn}") == "vpc-lattice:TagResource"
+        assert act("DELETE", f"/tags/{arn}", {"tagKeys": ["a"]}) == "vpc-lattice:UntagResource"
+        assert act("GET", f"/tags/{arn}") == "vpc-lattice:ListTagsForResource"
 
     def test_unknown_service_returns_none(self):
         from ministack.core.iam_actions import extract_iam_action
