@@ -33,7 +33,7 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 
 from defusedxml.ElementTree import fromstring
 
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid
 
 logger = logging.getLogger("route53")
 
@@ -105,6 +105,9 @@ def reset():
 _ID_CHARS = string.ascii_uppercase + string.digits
 
 
+_zone_id_re = re.compile(r"^Z[A-Z0-9]+$")
+
+
 def _zone_id() -> str:
     return "Z" + "".join(random.choices(_ID_CHARS, k=13))
 
@@ -115,6 +118,13 @@ def _change_id() -> str:
 
 def _hc_id() -> str:
     return new_uuid()
+
+
+def _new_change(comment: str = "") -> dict:
+    """Record a PENDING change so GetChange can find it. Call under _lock."""
+    change = {"id": _change_id(), "status": "PENDING", "submitted_at": _now_iso(), "comment": comment}
+    _changes[change["id"]] = change
+    return change
 
 
 # ─── XML helpers ─────────────────────────────────────────────────────────────
@@ -250,14 +260,43 @@ def _build_vpc_el(parent: Element, vpc: dict):
 
 
 def _parse_vpc(root):
-    """The request's <VPC> element as {VPCRegion, VPCId}, or None when absent."""
+    """The request's <VPC> element as ({VPCRegion, VPCId}, None), (None, None)
+    when absent, or (None, error response) when incomplete."""
     vpc_el = _find(root, "VPC")
     if vpc_el is None:
         return None, None
     vpc_id = _text(vpc_el, "VPCId")
-    if not vpc_id:
-        return None, _error_response("InvalidVPCId", "The VPC ID is missing.")
-    return {"VPCRegion": _text(vpc_el, "VPCRegion") or get_region(), "VPCId": vpc_id}, None
+    if not vpc_id.startswith("vpc-"):
+        return None, _error_response("InvalidVPCId", f"The VPC ID '{vpc_id}' is not valid.")
+    # Route 53 is a global endpoint, so the request region says nothing about
+    # where the VPC lives; the VPC element needs both members.
+    vpc_region = _text(vpc_el, "VPCRegion")
+    if not vpc_region:
+        return None, _error_response("InvalidInput", "VPCRegion is required with VPCId.")
+    return {"VPCRegion": vpc_region, "VPCId": vpc_id}, None
+
+
+def _vpc_key(vpc: dict) -> tuple:
+    return (vpc["VPCRegion"], vpc["VPCId"])
+
+
+def _zone_has_vpc(zone: dict, vpc: dict) -> bool:
+    return any(_vpc_key(v) == _vpc_key(vpc) for v in zone.get("vpcs", []))
+
+
+def _same_name_zone_with_vpc(name: str, vpc: dict, exclude_id: str = ""):
+    """Another private zone of this name already associated with the VPC. Call under _lock."""
+    return next((z for z in _zones.values()
+                 if z["id"] != exclude_id and z.get("private") and z["name"] == name
+                 and _zone_has_vpc(z, vpc)), None)
+
+
+def _build_zone_location_el(parent: Element, zone: dict):
+    """CreateHostedZone answers a private zone with its VPC, a public one with its delegation set."""
+    if zone.get("private") and zone.get("vpcs"):
+        _build_vpc_el(parent, zone["vpcs"][0])
+    else:
+        _build_delegation_set_el(parent, zone["name"])
 
 
 def _build_delegation_set_el(parent: Element, zone_name: str):
@@ -457,39 +496,32 @@ def _create_hosted_zone(body: bytes, query_params: dict):
 
     with _lock:
         if caller_ref in _caller_refs:
-            existing_id = _caller_refs[caller_ref]
-            zone = _zones[existing_id]
-            change = {"id": _change_id(), "status": "PENDING", "submitted_at": _now_iso(), "comment": ""}
-            def build(root):
-                _build_hosted_zone_el(root, zone)
-                _build_change_info_el(root, change)
-                _build_delegation_set_el(root, zone["name"])
-            return _xml_response("CreateHostedZoneResponse", build, 201)
-
-        zone_id = _zone_id()
-        zone = {
-            "id": zone_id,
-            "name": name,
-            "caller_reference": caller_ref,
-            "comment": comment,
-            "private": private,
-            "vpcs": [vpc] if vpc else [],
-        }
-        _zones[zone_id] = zone
-        _records[zone_id] = _default_records(name)
-        _caller_refs[caller_ref] = zone_id
-
-        change_id = _change_id()
-        change = {"id": change_id, "status": "PENDING", "submitted_at": _now_iso(), "comment": ""}
-        _changes[change_id] = change
+            # Idempotent replay: answer with the stored zone, private or public.
+            zone = _zones[_caller_refs[caller_ref]]
+        else:
+            if vpc and _same_name_zone_with_vpc(name, vpc):
+                return _error_response(
+                    "ConflictingDomainExists",
+                    f"A private hosted zone named {name} is already associated with "
+                    f"VPC {vpc['VPCId']} in {vpc['VPCRegion']}.")
+            zone_id = _zone_id()
+            zone = {
+                "id": zone_id,
+                "name": name,
+                "caller_reference": caller_ref,
+                "comment": comment,
+                "private": private,
+                "vpcs": [vpc] if vpc else [],
+            }
+            _zones[zone_id] = zone
+            _records[zone_id] = _default_records(name)
+            _caller_refs[caller_ref] = zone_id
+        change = _new_change()
 
     def build(root):
         _build_hosted_zone_el(root, zone)
         _build_change_info_el(root, change)
-        if vpc:
-            _build_vpc_el(root, vpc)
-        else:
-            _build_delegation_set_el(root, name)
+        _build_zone_location_el(root, zone)
 
     return _xml_response("CreateHostedZoneResponse", build, 201)
 
@@ -527,9 +559,7 @@ def _delete_hosted_zone(zone_id: str):
         del _zones[zone_id]
         del _records[zone_id]
         _caller_refs.pop(zone.get("caller_reference", ""), None)
-        change_id = _change_id()
-        change = {"id": change_id, "status": "PENDING", "submitted_at": _now_iso(), "comment": ""}
-        _changes[change_id] = change
+        change = _new_change()
 
     def build(root):
         _build_change_info_el(root, change)
@@ -688,9 +718,7 @@ def _change_resource_record_sets(zone_id: str, body: bytes):
                 return _error_response("InvalidInput", f"Unknown action: {action}")
 
         _records[zone_id] = current
-        change_id = _change_id()
-        change = {"id": change_id, "status": "PENDING", "submitted_at": _now_iso(), "comment": comment}
-        _changes[change_id] = change
+        change = _new_change(comment)
 
     def build(root):
         _build_change_info_el(root, change)
@@ -783,21 +811,23 @@ def _get_change(change_id: str):
 
 # ─── private zone VPC associations ────────────────────────────────────────────
 
-def _new_change():
-    change = {"id": _change_id(), "status": "PENDING", "submitted_at": _now_iso(), "comment": ""}
-    _changes[change["id"]] = change
-    return change
+def _parse_vpc_request(body: bytes):
+    """The VPC and optional Comment of an associate/disassociate request."""
+    root = _parse_body(body)
+    if root is None:
+        return None, "", _error_response("InvalidInput", "Missing or invalid request body.")
+    vpc, err = _parse_vpc(root)
+    if err:
+        return None, "", err
+    if not vpc:
+        return None, "", _error_response("InvalidInput", "VPC is required.")
+    return vpc, _text(root, "Comment"), None
 
 
 def _associate_vpc(zone_id: str, body: bytes):
-    root = _parse_body(body)
-    if root is None:
-        return _error_response("InvalidInput", "Missing or invalid request body.")
-    vpc, err = _parse_vpc(root)
+    vpc, comment, err = _parse_vpc_request(body)
     if err:
         return err
-    if not vpc:
-        return _error_response("InvalidInput", "VPC is required.")
     with _lock:
         zone = _zones.get(zone_id)
         if not zone:
@@ -805,40 +835,34 @@ def _associate_vpc(zone_id: str, body: bytes):
         if not zone.get("private"):
             return _error_response("PublicZoneVPCAssociation",
                                    "You can't associate a VPC with a public hosted zone.")
-        vpcs = zone.setdefault("vpcs", [])
-        if vpc in vpcs:
+        if _zone_has_vpc(zone, vpc) or _same_name_zone_with_vpc(zone["name"], vpc, exclude_id=zone_id):
             return _error_response(
                 "ConflictingDomainExists",
-                f"The VPC {vpc['VPCId']} in {vpc['VPCRegion']} is already associated with the hosted zone.")
-        vpcs.append(vpc)
-        change = _new_change()
+                f"The VPC {vpc['VPCId']} in {vpc['VPCRegion']} is already associated with "
+                f"a hosted zone named {zone['name']}.")
+        zone.setdefault("vpcs", []).append(vpc)
+        change = _new_change(comment)
     return _xml_response("AssociateVPCWithHostedZoneResponse",
                          lambda root: _build_change_info_el(root, change))
 
 
 def _disassociate_vpc(zone_id: str, body: bytes):
-    root = _parse_body(body)
-    if root is None:
-        return _error_response("InvalidInput", "Missing or invalid request body.")
-    vpc, err = _parse_vpc(root)
+    vpc, comment, err = _parse_vpc_request(body)
     if err:
         return err
-    if not vpc:
-        return _error_response("InvalidInput", "VPC is required.")
     with _lock:
         zone = _zones.get(zone_id)
         if not zone:
             return _error_response("NoSuchHostedZone", f"No hosted zone found with ID: {zone_id}", 404)
-        vpcs = zone.get("vpcs", [])
-        if vpc not in vpcs:
+        if not _zone_has_vpc(zone, vpc):
             return _error_response(
                 "VPCAssociationNotFound",
                 f"The VPC {vpc['VPCId']} in {vpc['VPCRegion']} is not associated with the hosted zone.", 404)
-        if len(vpcs) == 1:
+        if len(zone["vpcs"]) == 1:
             return _error_response("LastVPCAssociation",
                                    "A private hosted zone must stay associated with at least one VPC.")
-        vpcs.remove(vpc)
-        change = _new_change()
+        zone["vpcs"] = [v for v in zone["vpcs"] if _vpc_key(v) != _vpc_key(vpc)]
+        change = _new_change(comment)
     return _xml_response("DisassociateVPCFromHostedZoneResponse",
                          lambda root: _build_change_info_el(root, change))
 
@@ -846,23 +870,38 @@ def _disassociate_vpc(zone_id: str, body: bytes):
 def _list_hosted_zones_by_vpc(query_params: dict):
     def q(name):
         v = query_params.get(name, "")
-        return v[0] if isinstance(v, list) else v
-    vpc_id, vpc_region = q("vpcid"), q("vpcregion")
+        return (v[0] if isinstance(v, list) else v) or ""
+    vpc_id, vpc_region, next_token = q("vpcid"), q("vpcregion"), q("nexttoken")
     if not vpc_id or not vpc_region:
         return _error_response("InvalidInput", "vpcid and vpcregion are required.")
+    try:
+        max_items = min(int(q("maxitems") or 100), 100)
+    except ValueError:
+        return _error_response("InvalidInput", "maxitems must be an integer.")
+    if max_items < 1:
+        return _error_response("InvalidInput", "maxitems must be at least 1.")
     target = {"VPCRegion": vpc_region, "VPCId": vpc_id}
     with _lock:
-        zones = [z for z in _zones.values() if target in z.get("vpcs", [])]
+        zones = sorted((z for z in _zones.values() if _zone_has_vpc(z, target)), key=lambda z: z["id"])
+    # NextToken is the id of the first zone on the next page.
+    if next_token:
+        if not _zone_id_re.match(next_token):
+            return _error_response("InvalidPaginationToken", "The NextToken value is not valid.")
+        zones = [z for z in zones if z["id"] >= next_token]
+    page = zones[:max_items]
+    token = zones[max_items]["id"] if len(zones) > max_items else None
 
     def build(root):
         summaries = SubElement(root, "HostedZoneSummaries")
-        for zone in zones:
+        for zone in page:
             item = SubElement(summaries, "HostedZoneSummary")
             SubElement(item, "HostedZoneId").text = zone["id"]
             SubElement(item, "Name").text = zone["name"]
             owner = SubElement(item, "Owner")
             SubElement(owner, "OwningAccount").text = get_account_id()
-        SubElement(root, "MaxItems").text = q("maxitems") or "100"
+        SubElement(root, "MaxItems").text = str(max_items)
+        if token:
+            SubElement(root, "NextToken").text = token
 
     return _xml_response("ListHostedZonesByVPCResponse", build)
 
