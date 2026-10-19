@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **API Gateway — REST API status and root resource** — REST APIs carried no `apiStatus` or `rootResourceId`, so Terraform AWS provider 6.x timed out waiting for `AVAILABLE` after `CreateRestApi`; `CreateRestApi`, `GetRestApi`, `GetRestApis`, `UpdateRestApi` and imports now return `apiStatus` `AVAILABLE` and the root resource's id.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

@@ -50,6 +50,25 @@ def test_apigwv1_get_rest_apis(apigw_v1):
     apigw_v1.delete_rest_api(restApiId=id1)
     apigw_v1.delete_rest_api(restApiId=id2)
 
+def test_apigwv1_rest_api_status_and_root_resource(apigw_v1):
+    """REST APIs report apiStatus AVAILABLE and rootResourceId; Terraform AWS provider 6.x waits on apiStatus after create."""
+    created = apigw_v1.create_rest_api(name="v1-status-test")
+    api_id = created["id"]
+    root = [r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/"][0]
+    assert created["apiStatus"] == "AVAILABLE"
+    assert created["rootResourceId"] == root["id"]
+    got = apigw_v1.get_rest_api(restApiId=api_id)
+    assert got["apiStatus"] == "AVAILABLE"
+    assert got["rootResourceId"] == root["id"]
+    listed = [a for a in apigw_v1.get_rest_apis()["items"] if a["id"] == api_id]
+    assert listed[0]["apiStatus"] == "AVAILABLE"
+    updated = apigw_v1.update_rest_api(
+        restApiId=api_id,
+        patchOperations=[{"op": "replace", "path": "/description", "value": "changed"}],
+    )
+    assert updated["apiStatus"] == "AVAILABLE"
+    apigw_v1.delete_rest_api(restApiId=api_id)
+
 def test_apigwv1_get_account_defaults_and_update_roundtrip(apigw_v1):
     """GetAccount returns AWS-shaped defaults; UpdateAccount with /cloudwatchRoleArn
     patch op round-trips. Single test to avoid cross-test state bleed on the
