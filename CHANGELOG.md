@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Application Auto Scaling — control plane** — new `application-autoscaling` service: scalable targets (register, describe, deregister), step / target-tracking / predictive scaling policies, scheduled actions and tags, per account and region; deregistering a target removes its policies and actions. Nothing changes capacity.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
