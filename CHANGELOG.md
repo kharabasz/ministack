@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **S3 — replication rule options are kept** — `PutBucketReplication` dropped `SourceSelectionCriteria` and `ExistingObjectReplication` from each rule and `EncryptionConfiguration`, `ReplicationTime` and `Metrics` from its destination, so Terraform's `aws_s3_bucket_replication_configuration` planned a change on every run; `GetBucketReplication` now returns them as put, with `Minutes` as an integer, and a missing or unknown `Status` (or a `ReplicationTime` without `Time`) answers 400 `MalformedXML`. They are stored only: they do not change which objects are replicated, and the model's cross-field rules (`ReplicationTime` with `Metrics`, `SourceSelectionCriteria` with `SseKmsEncryptedObjects` and `EncryptionConfiguration`) are not checked. Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

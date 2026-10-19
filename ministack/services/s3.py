@@ -7068,6 +7068,116 @@ def _replication_filter_xml(filter_el, rule_filter: dict) -> None:
             _tag(and_el, tag)
 
 
+# Rule and destination settings from the botocore s3 model (ReplicationRule,
+# Destination, SourceSelectionCriteria, ExistingObjectReplication,
+# EncryptionConfiguration, ReplicationTime, Metrics). MiniStack stores and
+# returns them so IaC state matches; they do not change which objects the
+# data plane replicates or how (_replication_rule_for ignores them).
+_REPLICATION_STATUSES = ("Enabled", "Disabled")
+
+
+class _MalformedReplication(Exception):
+    pass
+
+
+def _replication_status(parent, name):
+    """``{"Status": ...}`` of the *name* child of *parent*, or None if absent.
+
+    Status is a required Enabled|Disabled member of each of these shapes, so a
+    missing or other value is refused rather than stored.
+    """
+    el = _find_xml_tag(parent, name)
+    if el is None:
+        return None
+    status_el = _find_xml_tag(el, "Status")
+    status = status_el.text if status_el is not None else None
+    if status not in _REPLICATION_STATUSES:
+        raise _MalformedReplication(name)
+    return {"Status": status}
+
+
+def _replication_minutes(parent, name):
+    """``{"Minutes": int}`` of a ReplicationTimeValue child, None if absent."""
+    el = _find_xml_tag(parent, name)
+    if el is None:
+        return None
+    minutes_el = _find_xml_tag(el, "Minutes")
+    if minutes_el is None:
+        return {}
+    text = (minutes_el.text or "").strip()
+    if not text.isdigit():
+        raise _MalformedReplication(name)
+    return {"Minutes": int(text)}
+
+
+def _parse_replication_rule_options(rule_el, rule: dict) -> None:
+    ssc_el = _find_xml_tag(rule_el, "SourceSelectionCriteria")
+    if ssc_el is not None:
+        ssc: dict = {}
+        for name in ("SseKmsEncryptedObjects", "ReplicaModifications"):
+            value = _replication_status(ssc_el, name)
+            if value is not None:
+                ssc[name] = value
+        rule["SourceSelectionCriteria"] = ssc
+    eor = _replication_status(rule_el, "ExistingObjectReplication")
+    if eor is not None:
+        rule["ExistingObjectReplication"] = eor
+
+
+def _parse_replication_destination_options(dest_el, dest: dict) -> None:
+    enc_el = _find_xml_tag(dest_el, "EncryptionConfiguration")
+    if enc_el is not None:
+        key_el = _find_xml_tag(enc_el, "ReplicaKmsKeyID")
+        dest["EncryptionConfiguration"] = (
+            {"ReplicaKmsKeyID": key_el.text} if key_el is not None and key_el.text else {})
+    rtc = _replication_status(dest_el, "ReplicationTime")
+    if rtc is not None:
+        time_value = _replication_minutes(_find_xml_tag(dest_el, "ReplicationTime"), "Time")
+        if time_value is None:
+            raise _MalformedReplication("ReplicationTime")
+        dest["ReplicationTime"] = {**rtc, "Time": time_value}
+    metrics = _replication_status(dest_el, "Metrics")
+    if metrics is not None:
+        threshold = _replication_minutes(_find_xml_tag(dest_el, "Metrics"), "EventThreshold")
+        if threshold is not None:
+            metrics["EventThreshold"] = threshold
+        dest["Metrics"] = metrics
+
+
+def _replication_minutes_xml(parent, name, value: dict) -> None:
+    el = SubElement(parent, name)
+    if "Minutes" in value:
+        SubElement(el, "Minutes").text = str(value["Minutes"])
+
+
+def _replication_rule_options_xml(rule_el, rule: dict) -> None:
+    if "SourceSelectionCriteria" in rule:
+        ssc_el = SubElement(rule_el, "SourceSelectionCriteria")
+        for name in ("SseKmsEncryptedObjects", "ReplicaModifications"):
+            if name in rule["SourceSelectionCriteria"]:
+                SubElement(SubElement(ssc_el, name), "Status").text = (
+                    rule["SourceSelectionCriteria"][name]["Status"])
+    if "ExistingObjectReplication" in rule:
+        SubElement(SubElement(rule_el, "ExistingObjectReplication"), "Status").text = (
+            rule["ExistingObjectReplication"]["Status"])
+
+
+def _replication_destination_options_xml(dest_el, dest: dict) -> None:
+    if "EncryptionConfiguration" in dest:
+        enc_el = SubElement(dest_el, "EncryptionConfiguration")
+        if "ReplicaKmsKeyID" in dest["EncryptionConfiguration"]:
+            SubElement(enc_el, "ReplicaKmsKeyID").text = dest["EncryptionConfiguration"]["ReplicaKmsKeyID"]
+    if "ReplicationTime" in dest:
+        rtc_el = SubElement(dest_el, "ReplicationTime")
+        SubElement(rtc_el, "Status").text = dest["ReplicationTime"]["Status"]
+        _replication_minutes_xml(rtc_el, "Time", dest["ReplicationTime"]["Time"])
+    if "Metrics" in dest:
+        metrics_el = SubElement(dest_el, "Metrics")
+        SubElement(metrics_el, "Status").text = dest["Metrics"]["Status"]
+        if "EventThreshold" in dest["Metrics"]:
+            _replication_minutes_xml(metrics_el, "EventThreshold", dest["Metrics"]["EventThreshold"])
+
+
 def _put_bucket_replication(bucket_name: str, body: bytes):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
@@ -7141,7 +7251,15 @@ def _put_bucket_replication(bucket_name: str, body: bytes):
             sc_el = _find_xml_tag(dest_el, "StorageClass")
             if sc_el is not None and sc_el.text:
                 dest["StorageClass"] = sc_el.text
+            try:
+                _parse_replication_destination_options(dest_el, dest)
+            except _MalformedReplication:
+                return _error("MalformedXML", "The XML you provided was not well-formed", 400)
             rule["Destination"] = dest
+        try:
+            _parse_replication_rule_options(rule_el, rule)
+        except _MalformedReplication:
+            return _error("MalformedXML", "The XML you provided was not well-formed", 400)
         rules.append(rule)
 
     if not rules:
@@ -7181,6 +7299,7 @@ def _get_bucket_replication(bucket_name: str):
             dmr_el = SubElement(rule_el, "DeleteMarkerReplication")
             SubElement(dmr_el, "Status").text = (rule["DeleteMarkerReplication"] or {}).get(
                 "Status", "Disabled")
+        _replication_rule_options_xml(rule_el, rule)
         dest = rule.get("Destination", {})
         if dest:
             dest_el = SubElement(rule_el, "Destination")
@@ -7194,6 +7313,7 @@ def _get_bucket_replication(bucket_name: str):
                 SubElement(dest_el, "Bucket").text = dest["Bucket"]
             if "StorageClass" in dest:
                 SubElement(dest_el, "StorageClass").text = dest["StorageClass"]
+            _replication_destination_options_xml(dest_el, dest)
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
