@@ -440,12 +440,6 @@ SERVICE_PATTERNS = {
     },
     "vpc-lattice": {
         "host_patterns": [r"vpc-lattice\."],
-        "path_prefixes": [
-            "/servicenetworks",
-            "/servicenetworkvpcassociations",
-            "/accesslogsubscriptions",
-            "/authpolicy/",
-        ],
         "credential_scope": "vpc-lattice",
     },
     "autoscaling": {
