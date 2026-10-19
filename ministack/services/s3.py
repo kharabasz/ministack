@@ -7068,6 +7068,29 @@ def _replication_filter_xml(filter_el, rule_filter: dict) -> None:
             _tag(and_el, tag)
 
 
+# Nested replication settings MiniStack stores as given and returns unchanged:
+# rule-level and destination-level elements, each a tree of named children.
+_REPLICATION_RULE_PASSTHROUGH = ("SourceSelectionCriteria", "ExistingObjectReplication")
+_REPLICATION_DEST_PASSTHROUGH = ("EncryptionConfiguration", "ReplicationTime", "Metrics")
+
+
+def _xml_tree_to_dict(el) -> dict:
+    """<A><B>x</B><C><D>y</D></C></A> -> {"B": "x", "C": {"D": "y"}} (namespace-insensitive)."""
+    out: dict = {}
+    for child in el:
+        name = child.tag.split("}")[-1]
+        out[name] = _xml_tree_to_dict(child) if len(child) else (child.text or "")
+    return out
+
+
+def _dict_to_xml_tree(parent, value: dict):
+    for name, child in value.items():
+        if isinstance(child, dict):
+            _dict_to_xml_tree(SubElement(parent, name), child)
+        else:
+            SubElement(parent, name).text = str(child)
+
+
 def _put_bucket_replication(bucket_name: str, body: bytes):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
@@ -7141,7 +7164,15 @@ def _put_bucket_replication(bucket_name: str, body: bytes):
             sc_el = _find_xml_tag(dest_el, "StorageClass")
             if sc_el is not None and sc_el.text:
                 dest["StorageClass"] = sc_el.text
+            for name in _REPLICATION_DEST_PASSTHROUGH:
+                el = _find_xml_tag(dest_el, name)
+                if el is not None:
+                    dest[name] = _xml_tree_to_dict(el)
             rule["Destination"] = dest
+        for name in _REPLICATION_RULE_PASSTHROUGH:
+            el = _find_xml_tag(rule_el, name)
+            if el is not None:
+                rule[name] = _xml_tree_to_dict(el)
         rules.append(rule)
 
     if not rules:
@@ -7181,6 +7212,9 @@ def _get_bucket_replication(bucket_name: str):
             dmr_el = SubElement(rule_el, "DeleteMarkerReplication")
             SubElement(dmr_el, "Status").text = (rule["DeleteMarkerReplication"] or {}).get(
                 "Status", "Disabled")
+        for name in _REPLICATION_RULE_PASSTHROUGH:
+            if name in rule:
+                _dict_to_xml_tree(SubElement(rule_el, name), rule[name])
         dest = rule.get("Destination", {})
         if dest:
             dest_el = SubElement(rule_el, "Destination")
@@ -7194,6 +7228,9 @@ def _get_bucket_replication(bucket_name: str):
                 SubElement(dest_el, "Bucket").text = dest["Bucket"]
             if "StorageClass" in dest:
                 SubElement(dest_el, "StorageClass").text = dest["StorageClass"]
+            for name in _REPLICATION_DEST_PASSTHROUGH:
+                if name in dest:
+                    _dict_to_xml_tree(SubElement(dest_el, name), dest[name])
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
