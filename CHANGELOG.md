@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CloudFront — `CreateFunction` tags** — the request's `Tags` were dropped, so `ListTagsForResource` on the new function's ARN was empty; they are now stored, and `DeleteFunction` removes them so a function created again under the same name starts without them. Contributed by @kharabasz.
+- **CloudWatch — `PutMetricAlarm` tags on create** — `Tags` were dropped when the call created an alarm; they are now stored, and, as the API reference documents, they are still ignored when the call updates an existing alarm (use `TagResource` / `UntagResource`). Contributed by @kharabasz.
+- **CloudWatch — `DatapointsToAlarm` only when set** — an alarm created by `PutMetricAlarm` or `AWS::CloudWatch::Alarm` without `DatapointsToAlarm` reported it as `EvaluationPeriods`; `DescribeAlarms` now leaves it out unless the request or template sets it (and the Query response includes it when set). An update that omits it clears it. Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

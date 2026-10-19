@@ -431,7 +431,8 @@ def _unwrap_distribution_create_xml(root_el):
 
 
 def _ingest_distribution_tags_from_xml(dist_arn: str, tags_el):
-    """Apply tag Items from CreateDistributionWithTags onto ``_tags``."""
+    """Apply the tag Items of a create request's ``Tags`` element onto ``_tags``
+    (CreateDistributionWithTags, CreateFunction and the other create calls)."""
     if tags_el is None:
         return
     items_el = _find(tags_el, "Items") or tags_el
@@ -821,6 +822,9 @@ def _cf_create_function(headers, body):
         # The body PublishFunction froze; LIVE serves this, not the working copy.
         "live_body": None,
     }
+    # CreateFunctionRequest carries an optional Tags element, like
+    # CreateDistributionWithTags; ListTagsForResource reads them on the ARN.
+    _ingest_distribution_tags_from_xml(fn["arn"], _find(el, "Tags"))
     _functions[name] = fn
     logger.info("CreateFunction name=%s", name)
 
@@ -994,6 +998,7 @@ def _cf_delete_function(name: str, headers):
         )
 
     del _functions[name]
+    _tags.pop(fn["arn"], None)
     logger.info("DeleteFunction name=%s", name)
     return 204, {}, b""
 
