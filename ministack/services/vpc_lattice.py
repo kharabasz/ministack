@@ -19,9 +19,11 @@ Supports:
 
 Not emulated: services, target groups, listeners, rules, resource
 configurations, and any request routing. VPC associations are ACTIVE on
-create and gone after delete.
+create and gone after delete. VPC and security group IDs are checked for
+shape only, not against EC2 state.
 """
 
+import base64
 import copy
 import json
 import logging
@@ -32,11 +34,15 @@ from urllib.parse import unquote
 
 from ministack.core.responses import (
     AccountRegionScopedDict,
+    error_response_json,
     get_account_id,
     get_region,
+    json_response,
 )
 
 logger = logging.getLogger("vpc-lattice")
+
+_JSON_CT = "application/json"
 
 # ---------------------------------------------------------------------------
 # State
@@ -47,6 +53,7 @@ _vpc_associations = AccountRegionScopedDict()   # snva_id -> VPC association rec
 _auth_policies = AccountRegionScopedDict()      # resource ARN -> auth policy record
 _access_log_subscriptions = AccountRegionScopedDict()  # als_id -> subscription record
 _tags = AccountRegionScopedDict()               # resource ARN -> {key: value}
+_client_tokens = AccountRegionScopedDict()      # "<operation>:<token>" -> {"request", "id"}
 
 
 def reset():
@@ -55,6 +62,7 @@ def reset():
     _auth_policies.clear()
     _access_log_subscriptions.clear()
     _tags.clear()
+    _client_tokens.clear()
 
 
 def get_state():
@@ -64,6 +72,7 @@ def get_state():
         "auth_policies": copy.deepcopy(_auth_policies),
         "access_log_subscriptions": copy.deepcopy(_access_log_subscriptions),
         "tags": copy.deepcopy(_tags),
+        "client_tokens": copy.deepcopy(_client_tokens),
     }
 
 
@@ -75,6 +84,7 @@ def load_persisted_state(data):
     _auth_policies.update(data.get("auth_policies", {}))
     _access_log_subscriptions.update(data.get("access_log_subscriptions", {}))
     _tags.update(data.get("tags", {}))
+    _client_tokens.update(data.get("client_tokens", {}))
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +93,22 @@ def load_persisted_state(data):
 
 _AUTH_TYPES = ("NONE", "AWS_IAM")
 _LOG_TYPES = ("SERVICE", "RESOURCE")
-_NAME_RE = re.compile(r"^(?!servicenetwork-)(?!-)(?![a-z0-9-]*--)[a-z0-9-]{3,63}(?<!-)$")
+
+# Patterns and lengths from the botocore vpc-lattice model.
+_NAME_RE = re.compile(r"(?![-])(?!.*[-]$)(?!.*[-]{2})[a-z0-9-]{3,63}")
+_ARN_PREFIX = r"arn:[a-z0-9\-]+:vpc-lattice:[a-zA-Z0-9\-]+:\d{12}:"
+_SN_ID_RE = re.compile(rf"(sn-[0-9a-z]{{17}})|({_ARN_PREFIX}servicenetwork/sn-[0-9a-z]{{17}})")
+_SNVA_ID_RE = re.compile(
+    rf"(snva-[0-9a-z]{{17}})|({_ARN_PREFIX}servicenetworkvpcassociation/snva-[0-9a-z]{{17}})")
+_ALS_ID_RE = re.compile(rf"(als-[0-9a-z]{{17}})|({_ARN_PREFIX}accesslogsubscription/als-[0-9a-z]{{17}})")
+_RESOURCE_ID_RE = re.compile(
+    r"((((sn)|(svc)|(rcfg))-[0-9a-z]{17})|(arn(:[a-z0-9]+([.-][a-z0-9]+)*){2}"
+    r"(:([a-z0-9]+([.-][a-z0-9]+)*)?){2}:((servicenetwork/sn)|(resourceconfiguration/rcfg)"
+    r"|(service/svc))-[0-9a-z]{17}))")
+_VPC_ID_RE = re.compile(r"vpc-(([0-9a-z]{8})|([0-9a-z]{17}))")
+# CreateAccessLogSubscription documents S3 buckets, CloudWatch Logs log groups
+# and Firehose delivery streams as the supported destinations.
+_DESTINATION_RE = re.compile(r"arn:aws[a-z-]*:(s3|logs|firehose):.+")
 
 
 def _now():
@@ -91,7 +116,7 @@ def _now():
 
 
 def _new_id(prefix):
-    return f"{prefix}-" + "".join(random.choices("0123456789abcdef", k=17))
+    return f"{prefix}-" + "".join(random.choices("0123456789abcdefghijklmnopqrstuvwxyz", k=17))
 
 
 def _arn(resource_type, resource_id):
@@ -99,12 +124,11 @@ def _arn(resource_type, resource_id):
 
 
 def _json(status, body):
-    return status, {"Content-Type": "application/json"}, json.dumps(body).encode()
+    return json_response(body, status, content_type=_JSON_CT)
 
 
 def _error(status, code, message, **fields):
-    body = {"message": message, **fields}
-    return status, {"Content-Type": "application/json", "x-amzn-errortype": code}, json.dumps(body).encode()
+    return error_response_json(code, message, status, extra=fields or None, content_type=_JSON_CT)
 
 
 def _not_found(resource_type, resource_id):
@@ -125,21 +149,21 @@ def _validation(message, field=None):
     return _error(400, "ValidationException", message, **extra)
 
 
-def _id_from_identifier(identifier):
-    """Identifiers are an ID or an ARN; ARNs end in /<id>."""
-    return identifier.rsplit("/", 1)[-1] if identifier.startswith("arn:") else identifier
+def _invalid_identifier(field, value):
+    return _validation(f"Invalid {field}: {value}", field)
+
+
+def _lookup(store, identifier):
+    """Resolve an ID or ARN. An ARN must match the stored ARN exactly, so an
+    ARN naming another account or region is not found in this one."""
+    if identifier.startswith("arn:"):
+        record = store.get(identifier.rsplit("/", 1)[-1])
+        return record if record and record["arn"] == identifier else None
+    return store.get(identifier)
 
 
 def _find_service_network(identifier):
-    sn_id = _id_from_identifier(identifier)
-    sn = _service_networks.get(sn_id)
-    if sn:
-        return sn
-    # GetServiceNetwork also accepts the network's name.
-    for candidate in _service_networks.values():
-        if candidate["name"] == identifier:
-            return candidate
-    return None
+    return _lookup(_service_networks, identifier)
 
 
 def _set_tags(arn, tags):
@@ -154,6 +178,73 @@ def _drop_resource(arn):
     _auth_policies.pop(arn, None)
 
 
+def _idempotent_replay(operation, body, store, render):
+    """Replay a create that repeats a clientToken.
+
+    Returns a response when the token was seen before: the original output when
+    the parameters match, a ConflictException when they differ. Returns None for
+    a new token, or one whose resource has since been deleted.
+    """
+    token = body.get("clientToken")
+    if not token:
+        return None
+    seen = _client_tokens.get(f"{operation}:{token}")
+    if not seen:
+        return None
+    record = store.get(seen["id"])
+    if not record:
+        _client_tokens.pop(f"{operation}:{token}", None)
+        return None
+    if seen["request"] != _token_request(body):
+        return _conflict(seen.get("resourceType", "RESOURCE"), seen["id"],
+                         f"clientToken {token} was already used with different parameters")
+    return render(record)
+
+
+def _token_request(body):
+    return {k: v for k, v in body.items() if k != "clientToken"}
+
+
+def _remember_token(operation, body, resource_type, resource_id):
+    token = body.get("clientToken")
+    if token:
+        _client_tokens[f"{operation}:{token}"] = {
+            "request": _token_request(body), "id": resource_id, "resourceType": resource_type,
+        }
+
+
+_PAGE_DEFAULT = 100
+
+
+def _paginate(items, query):
+    """maxResults (1-100) and an opaque nextToken, as the model declares.
+    Items come in store order, which is creation order."""
+    raw_max = query.get("maxResults")
+    if raw_max in (None, ""):
+        max_results = _PAGE_DEFAULT
+    else:
+        try:
+            max_results = int(raw_max)
+        except (TypeError, ValueError):
+            return None, _validation(f"Invalid maxResults: {raw_max}", "maxResults")
+        if not 1 <= max_results <= 100:
+            return None, _validation("maxResults must be between 1 and 100", "maxResults")
+    start = 0
+    token = query.get("nextToken")
+    if token:
+        try:
+            start = int(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode())
+        except (ValueError, UnicodeDecodeError):
+            return None, _validation("Invalid nextToken", "nextToken")
+        if start < 0:
+            return None, _validation("Invalid nextToken", "nextToken")
+    end = start + max_results
+    page = {"items": items[start:end]}
+    if end < len(items):
+        page["nextToken"] = base64.urlsafe_b64encode(str(end).encode()).decode().rstrip("=")
+    return page, None
+
+
 # ---------------------------------------------------------------------------
 # Service networks
 # ---------------------------------------------------------------------------
@@ -163,14 +254,22 @@ def _sn_vpc_count(sn_id):
     return sum(1 for a in _vpc_associations.values() if a["serviceNetworkId"] == sn_id)
 
 
+def _sn_create_out(sn):
+    return {k: sn[k] for k in ("id", "name", "arn", "authType", "sharingConfig")}
+
+
 def _create_service_network(body):
+    replay = _idempotent_replay("CreateServiceNetwork", body, _service_networks,
+                                lambda sn: _json(201, _sn_create_out(sn)))
+    if replay:
+        return replay
     name = body.get("name")
     if not name:
         return _validation("name is required", "name")
-    if not _NAME_RE.match(name):
+    if not _NAME_RE.fullmatch(name):
         return _validation(
-            "name must be 3-63 lowercase letters, numbers or hyphens, must not start or end "
-            "with a hyphen, contain consecutive hyphens or start with servicenetwork-", "name")
+            "name must be 3-63 characters of a-z, 0-9 and hyphens, and must not start or end "
+            "with a hyphen or contain consecutive hyphens", "name")
     auth_type = body.get("authType", "NONE")
     if auth_type not in _AUTH_TYPES:
         return _validation(f"Invalid authType: {auth_type}", "authType")
@@ -191,7 +290,8 @@ def _create_service_network(body):
     }
     _service_networks[sn_id] = record
     _set_tags(record["arn"], body.get("tags"))
-    return _json(201, {k: record[k] for k in ("id", "name", "arn", "authType", "sharingConfig")})
+    _remember_token("CreateServiceNetwork", body, "SERVICE_NETWORK", sn_id)
+    return _json(201, _sn_create_out(record))
 
 
 def _sn_view(sn):
@@ -202,32 +302,46 @@ def _sn_view(sn):
     }
 
 
-def _get_service_network(identifier):
+def _resolve_sn(identifier, field="serviceNetworkIdentifier"):
+    """(record, error): validate the identifier shape, then look it up."""
+    if not _SN_ID_RE.fullmatch(identifier or ""):
+        return None, _invalid_identifier(field, identifier)
     sn = _find_service_network(identifier)
     if not sn:
-        return _not_found("SERVICE_NETWORK", identifier)
+        return None, _not_found("SERVICE_NETWORK", identifier)
+    return sn, None
+
+
+def _get_service_network(identifier):
+    sn, err = _resolve_sn(identifier)
+    if err:
+        return err
     return _json(200, _sn_view(sn))
 
 
 def _update_service_network(identifier, body):
-    sn = _find_service_network(identifier)
-    if not sn:
-        return _not_found("SERVICE_NETWORK", identifier)
     auth_type = body.get("authType")
+    if not auth_type:
+        return _validation("authType is required", "authType")
     if auth_type not in _AUTH_TYPES:
         return _validation(f"Invalid authType: {auth_type}", "authType")
+    sn, err = _resolve_sn(identifier)
+    if err:
+        return err
     sn["authType"] = auth_type
     sn["lastUpdatedAt"] = _now()
     return _json(200, {k: sn[k] for k in ("id", "name", "arn", "authType")})
 
 
 def _delete_service_network(identifier):
-    sn = _find_service_network(identifier)
-    if not sn:
-        return _not_found("SERVICE_NETWORK", identifier)
+    sn, err = _resolve_sn(identifier)
+    if err:
+        return err
     if _sn_vpc_count(sn["id"]):
         return _conflict("SERVICE_NETWORK", sn["id"],
                          "Service network has VPC associations; delete them first")
+    # The DeleteServiceNetwork documentation: deleting a network also deletes
+    # its auth policy and access log subscriptions.
     for sub_id, sub in list(_access_log_subscriptions.items()):
         if sub["resourceId"] == sn["id"]:
             _tags.pop(sub["arn"], None)
@@ -243,7 +357,8 @@ def _list_service_networks(query):
         | {"numberOfAssociatedResourceConfigurations": 0}
         for sn in _service_networks.values()
     ]
-    return _json(200, {"items": items})
+    page, err = _paginate(items, query)
+    return err or _json(200, page)
 
 
 # ---------------------------------------------------------------------------
@@ -260,16 +375,29 @@ def _association_view(assoc):
     }
 
 
+_ASSOC_CREATE_KEYS = ("id", "status", "arn", "createdBy", "securityGroupIds", "privateDnsEnabled", "dnsOptions")
+
+
+def _assoc_create_out(assoc):
+    return {k: assoc[k] for k in _ASSOC_CREATE_KEYS if k in assoc}
+
+
 def _create_vpc_association(body):
+    replay = _idempotent_replay("CreateServiceNetworkVpcAssociation", body, _vpc_associations,
+                                lambda a: _json(200, _assoc_create_out(a)))
+    if replay:
+        return replay
     sn_identifier = body.get("serviceNetworkIdentifier")
     vpc_id = body.get("vpcIdentifier")
     if not sn_identifier:
         return _validation("serviceNetworkIdentifier is required", "serviceNetworkIdentifier")
     if not vpc_id:
         return _validation("vpcIdentifier is required", "vpcIdentifier")
-    sn = _find_service_network(sn_identifier)
-    if not sn:
-        return _not_found("SERVICE_NETWORK", sn_identifier)
+    if not _VPC_ID_RE.fullmatch(vpc_id):
+        return _invalid_identifier("vpcIdentifier", vpc_id)
+    sn, err = _resolve_sn(sn_identifier)
+    if err:
+        return err
     for existing in _vpc_associations.values():
         if existing["serviceNetworkId"] == sn["id"] and existing["vpcId"] == vpc_id:
             return _conflict("SERVICE_NETWORK_VPC_ASSOCIATION", existing["id"],
@@ -292,25 +420,30 @@ def _create_vpc_association(body):
         record["dnsOptions"] = body["dnsOptions"]
     _vpc_associations[assoc_id] = record
     _set_tags(record["arn"], body.get("tags"))
-    out_keys = ("id", "status", "arn", "createdBy", "securityGroupIds", "privateDnsEnabled", "dnsOptions")
-    return _json(200, {k: record[k] for k in out_keys if k in record})
+    _remember_token("CreateServiceNetworkVpcAssociation", body, "SERVICE_NETWORK_VPC_ASSOCIATION", assoc_id)
+    return _json(200, _assoc_create_out(record))
 
 
-def _find_association(identifier):
-    return _vpc_associations.get(_id_from_identifier(identifier))
+def _resolve_assoc(identifier):
+    if not _SNVA_ID_RE.fullmatch(identifier or ""):
+        return None, _invalid_identifier("serviceNetworkVpcAssociationIdentifier", identifier)
+    assoc = _lookup(_vpc_associations, identifier)
+    if not assoc:
+        return None, _not_found("SERVICE_NETWORK_VPC_ASSOCIATION", identifier)
+    return assoc, None
 
 
 def _get_vpc_association(identifier):
-    assoc = _find_association(identifier)
-    if not assoc:
-        return _not_found("SERVICE_NETWORK_VPC_ASSOCIATION", identifier)
+    assoc, err = _resolve_assoc(identifier)
+    if err:
+        return err
     return _json(200, _association_view(assoc))
 
 
 def _update_vpc_association(identifier, body):
-    assoc = _find_association(identifier)
-    if not assoc:
-        return _not_found("SERVICE_NETWORK_VPC_ASSOCIATION", identifier)
+    assoc, err = _resolve_assoc(identifier)
+    if err:
+        return err
     if "securityGroupIds" in body:
         assoc["securityGroupIds"] = list(body["securityGroupIds"] or [])
     if "privateDnsEnabled" in body:
@@ -323,9 +456,9 @@ def _update_vpc_association(identifier, body):
 
 
 def _delete_vpc_association(identifier):
-    assoc = _find_association(identifier)
-    if not assoc:
-        return _not_found("SERVICE_NETWORK_VPC_ASSOCIATION", identifier)
+    assoc, err = _resolve_assoc(identifier)
+    if err:
+        return err
     _vpc_associations.pop(assoc["id"], None)
     _drop_resource(assoc["arn"])
     return _json(200, {"id": assoc["id"], "arn": assoc["arn"], "status": "DELETE_IN_PROGRESS"})
@@ -334,13 +467,17 @@ def _delete_vpc_association(identifier):
 def _list_vpc_associations(query):
     sn_identifier = query.get("serviceNetworkIdentifier")
     vpc_id = query.get("vpcIdentifier")
+    # The ListServiceNetworkVpcAssociations documentation: you must provide
+    # either the service network or the VPC.
     if not sn_identifier and not vpc_id:
         return _validation("Either serviceNetworkIdentifier or vpcIdentifier is required")
+    if vpc_id and not _VPC_ID_RE.fullmatch(vpc_id):
+        return _invalid_identifier("vpcIdentifier", vpc_id)
     sn_id = None
     if sn_identifier:
-        sn = _find_service_network(sn_identifier)
-        if not sn:
-            return _not_found("SERVICE_NETWORK", sn_identifier)
+        sn, err = _resolve_sn(sn_identifier)
+        if err:
+            return err
         sn_id = sn["id"]
     summary_keys = ("id", "arn", "status", "createdBy", "createdAt", "serviceNetworkId",
                     "serviceNetworkName", "serviceNetworkArn", "privateDnsEnabled",
@@ -351,7 +488,8 @@ def _list_vpc_associations(query):
         if (sn_id is None or a["serviceNetworkId"] == sn_id)
         and (not vpc_id or a["vpcId"] == vpc_id)
     ]
-    return _json(200, {"items": items})
+    page, err = _paginate(items, query)
+    return err or _json(200, page)
 
 
 # ---------------------------------------------------------------------------
@@ -359,22 +497,36 @@ def _list_vpc_associations(query):
 # ---------------------------------------------------------------------------
 
 
-def _resource_for(identifier):
-    """Resolve an auth-policy / access-log resource identifier to a service network."""
-    return _find_service_network(identifier)
+def _resolve_resource(identifier, field="resourceIdentifier"):
+    """Auth-policy / access-log resource: the model also accepts service and
+    resource-configuration identifiers, which this emulator does not hold."""
+    if not _RESOURCE_ID_RE.fullmatch(identifier or ""):
+        return None, _invalid_identifier(field, identifier)
+    sn = _find_service_network(identifier)
+    if not sn:
+        return None, _not_found("SERVICE_NETWORK", identifier)
+    return sn, None
+
+
+def _auth_policy_state(sn):
+    # The model's AuthPolicyState documentation: the policy is only active when
+    # the auth type is AWS_IAM; with NONE it remains inactive.
+    return "Active" if sn["authType"] == "AWS_IAM" else "Inactive"
 
 
 def _put_auth_policy(identifier, body):
-    sn = _resource_for(identifier)
-    if not sn:
-        return _not_found("SERVICE_NETWORK", identifier)
     policy = body.get("policy")
     if not policy:
         return _validation("policy is required", "policy")
     try:
-        json.loads(policy)
+        parsed = json.loads(policy)
     except (TypeError, ValueError):
+        parsed = None
+    if not isinstance(parsed, dict):
         return _validation("policy must be a JSON policy document", "policy")
+    sn, err = _resolve_resource(identifier)
+    if err:
+        return err
     now = _now()
     existing = _auth_policies.get(sn["arn"])
     _auth_policies[sn["arn"]] = {
@@ -385,15 +537,10 @@ def _put_auth_policy(identifier, body):
     return _json(200, {"policy": policy, "state": _auth_policy_state(sn)})
 
 
-def _auth_policy_state(sn):
-    # A policy only takes effect when the network's auth type is AWS_IAM.
-    return "Active" if sn["authType"] == "AWS_IAM" else "Inactive"
-
-
 def _get_auth_policy(identifier):
-    sn = _resource_for(identifier)
-    if not sn:
-        return _not_found("SERVICE_NETWORK", identifier)
+    sn, err = _resolve_resource(identifier)
+    if err:
+        return err
     record = _auth_policies.get(sn["arn"])
     if not record:
         return _not_found("AUTH_POLICY", identifier)
@@ -401,41 +548,41 @@ def _get_auth_policy(identifier):
 
 
 def _delete_auth_policy(identifier):
-    sn = _resource_for(identifier)
-    if not sn:
-        return _not_found("SERVICE_NETWORK", identifier)
+    sn, err = _resolve_resource(identifier)
+    if err:
+        return err
     _auth_policies.pop(sn["arn"], None)
     return 204, {}, b""
 
 
-def _subscription_out(sub):
-    return {k: sub[k] for k in ("id", "arn", "resourceId", "resourceArn",
-                                "serviceNetworkLogType", "destinationArn") if k in sub}
+_ALS_CREATE_KEYS = ("id", "arn", "resourceId", "resourceArn", "serviceNetworkLogType", "destinationArn")
+_ALS_UPDATE_KEYS = ("id", "arn", "resourceId", "resourceArn", "destinationArn")
+
+
+def _als_create_out(sub):
+    return {k: sub[k] for k in _ALS_CREATE_KEYS if k in sub}
 
 
 def _create_access_log_subscription(body):
+    replay = _idempotent_replay("CreateAccessLogSubscription", body, _access_log_subscriptions,
+                                lambda s: _json(201, _als_create_out(s)))
+    if replay:
+        return replay
     identifier = body.get("resourceIdentifier")
     destination = body.get("destinationArn")
     if not identifier:
         return _validation("resourceIdentifier is required", "resourceIdentifier")
     if not destination:
         return _validation("destinationArn is required", "destinationArn")
-    if not re.match(r"^arn:aws[a-z-]*:(s3|logs|firehose):", destination):
+    if not _DESTINATION_RE.fullmatch(destination):
         return _validation("destinationArn must be an S3 bucket, CloudWatch Logs log group or "
                            "Firehose delivery stream ARN", "destinationArn")
-    sn = _resource_for(identifier)
-    if not sn:
-        return _not_found("SERVICE_NETWORK", identifier)
     log_type = body.get("serviceNetworkLogType", "SERVICE")
     if log_type not in _LOG_TYPES:
         return _validation(f"Invalid serviceNetworkLogType: {log_type}", "serviceNetworkLogType")
-    dest_service = destination.split(":")[2]
-    for existing in _access_log_subscriptions.values():
-        if (existing["resourceId"] == sn["id"]
-                and existing["destinationArn"].split(":")[2] == dest_service
-                and existing.get("serviceNetworkLogType") == log_type):
-            return _conflict("ACCESS_LOG_SUBSCRIPTION", existing["id"],
-                             f"Service network {sn['id']} already has a {dest_service} access log subscription")
+    sn, err = _resolve_resource(identifier)
+    if err:
+        return err
     sub_id = _new_id("als")
     now = _now()
     record = {
@@ -450,38 +597,45 @@ def _create_access_log_subscription(body):
     }
     _access_log_subscriptions[sub_id] = record
     _set_tags(record["arn"], body.get("tags"))
-    return _json(201, _subscription_out(record))
+    _remember_token("CreateAccessLogSubscription", body, "ACCESS_LOG_SUBSCRIPTION", sub_id)
+    return _json(201, _als_create_out(record))
 
 
-def _find_subscription(identifier):
-    return _access_log_subscriptions.get(_id_from_identifier(identifier))
+def _resolve_subscription(identifier):
+    if not _ALS_ID_RE.fullmatch(identifier or ""):
+        return None, _invalid_identifier("accessLogSubscriptionIdentifier", identifier)
+    sub = _lookup(_access_log_subscriptions, identifier)
+    if not sub:
+        return None, _not_found("ACCESS_LOG_SUBSCRIPTION", identifier)
+    return sub, None
 
 
 def _get_access_log_subscription(identifier):
-    sub = _find_subscription(identifier)
-    if not sub:
-        return _not_found("ACCESS_LOG_SUBSCRIPTION", identifier)
+    sub, err = _resolve_subscription(identifier)
+    if err:
+        return err
     return _json(200, sub)
 
 
 def _update_access_log_subscription(identifier, body):
-    sub = _find_subscription(identifier)
-    if not sub:
-        return _not_found("ACCESS_LOG_SUBSCRIPTION", identifier)
     destination = body.get("destinationArn")
     if not destination:
         return _validation("destinationArn is required", "destinationArn")
-    if destination.split(":")[2:3] != sub["destinationArn"].split(":")[2:3]:
-        return _validation("destinationArn must stay the same destination type", "destinationArn")
+    if not _DESTINATION_RE.fullmatch(destination):
+        return _validation("destinationArn must be an S3 bucket, CloudWatch Logs log group or "
+                           "Firehose delivery stream ARN", "destinationArn")
+    sub, err = _resolve_subscription(identifier)
+    if err:
+        return err
     sub["destinationArn"] = destination
     sub["lastUpdatedAt"] = _now()
-    return _json(200, _subscription_out(sub))
+    return _json(200, {k: sub[k] for k in _ALS_UPDATE_KEYS})
 
 
 def _delete_access_log_subscription(identifier):
-    sub = _find_subscription(identifier)
-    if not sub:
-        return _not_found("ACCESS_LOG_SUBSCRIPTION", identifier)
+    sub, err = _resolve_subscription(identifier)
+    if err:
+        return err
     _access_log_subscriptions.pop(sub["id"], None)
     _tags.pop(sub["arn"], None)
     return 204, {}, b""
@@ -491,11 +645,12 @@ def _list_access_log_subscriptions(query):
     identifier = query.get("resourceIdentifier")
     if not identifier:
         return _validation("resourceIdentifier is required", "resourceIdentifier")
-    sn = _resource_for(identifier)
-    if not sn:
-        return _not_found("SERVICE_NETWORK", identifier)
+    sn, err = _resolve_resource(identifier)
+    if err:
+        return err
     items = [s for s in _access_log_subscriptions.values() if s["resourceId"] == sn["id"]]
-    return _json(200, {"items": items})
+    page, err = _paginate(items, query)
+    return err or _json(200, page)
 
 
 # ---------------------------------------------------------------------------
@@ -504,20 +659,15 @@ def _list_access_log_subscriptions(query):
 
 
 def _resource_exists(arn):
-    resource_id = _id_from_identifier(arn)
-    for store in (_service_networks, _vpc_associations, _access_log_subscriptions):
-        record = store.get(resource_id)
-        if record and record["arn"] == arn:
-            return True
-    return False
+    return any(_lookup(store, arn) for store in (_service_networks, _vpc_associations, _access_log_subscriptions))
 
 
 def _tag_resource(arn, body):
+    tags = body.get("tags")
+    if not isinstance(tags, dict) or not tags:
+        return _validation("tags is required", "tags")
     if not _resource_exists(arn):
         return _not_found("RESOURCE", arn)
-    tags = body.get("tags")
-    if not tags:
-        return _validation("tags is required", "tags")
     _set_tags(arn, tags)
     return _json(200, {})
 
@@ -557,6 +707,8 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         body = json.loads(body_bytes) if body_bytes else {}
     except json.JSONDecodeError:
         return _validation("Request body is not valid JSON")
+    if not isinstance(body, dict):
+        return _validation("Request body must be a JSON object")
     query = {k: (v[0] if isinstance(v, list) and v else v) for k, v in query_params.items()}
 
     if path == "/servicenetworks":
