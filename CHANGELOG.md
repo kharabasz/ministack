@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **CloudFront — VPC origins** — `CreateVpcOrigin`, `GetVpcOrigin`, `UpdateVpcOrigin`, `DeleteVpcOrigin` and `ListVpcOrigins`, `Deployed` on create, `If-Match`/ETag on update and delete, tags on `vpcorigin` ARNs, and `CannotDeleteEntityWhileInUse` while a distribution references the origin. Distributions keep their `VpcOriginConfig`; viewer requests are not routed to the VPC endpoint.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
