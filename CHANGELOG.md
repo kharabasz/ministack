@@ -13,7 +13,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **API Gateway — REST API status and root resource** — REST APIs carried no `apiStatus` or `rootResourceId`, so Terraform AWS provider 6.x timed out waiting for `AVAILABLE` after `CreateRestApi`; `CreateRestApi`, `GetRestApi`, `GetRestApis`, `UpdateRestApi` and imports now return `apiStatus` `AVAILABLE` and the root resource's id.
-- **Route 53 — private hosted zones keep their VPCs** — `CreateHostedZone` with a `VPC` made a public zone and dropped the VPC, so Terraform re-planned the association forever; the zone is now private, `GetHostedZone` returns its `VPCs` (and no delegation set), and `AssociateVPCWithHostedZone`, `DisassociateVPCFromHostedZone` and `ListHostedZonesByVPC` keep the list, refusing a public zone (`PublicZoneVPCAssociation`), a duplicate (`ConflictingDomainExists`), an unknown VPC (`VPCAssociationNotFound`) and the last association (`LastVPCAssociation`). A private zone requested without a VPC answers `InvalidInput`.
+- **Route 53 — private hosted zones keep their VPCs** — `CreateHostedZone` with a `VPC` made a public zone and dropped the VPC, so Terraform re-planned the association forever; the zone is now private, `GetHostedZone` returns its `VPCs` (and no delegation set), and `AssociateVPCWithHostedZone`, `DisassociateVPCFromHostedZone` and `ListHostedZonesByVPC` keep the list, refusing a public zone (`PublicZoneVPCAssociation`), a duplicate (`ConflictingDomainExists`), an unknown VPC (`VPCAssociationNotFound`) and the last association (`LastVPCAssociation`). Cloud Map private DNS namespaces now create their zone with the namespace's VPC.
 
 ## [1.5.29] — 2026-10-17
 

@@ -454,8 +454,6 @@ def _create_hosted_zone(body: bytes, query_params: dict):
         return err
     if vpc:
         private = True
-    elif private:
-        return _error_response("InvalidInput", "A private hosted zone requires a VPC.")
 
     with _lock:
         if caller_ref in _caller_refs:
