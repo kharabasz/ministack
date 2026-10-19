@@ -1063,9 +1063,9 @@ Supported runtimes and the AWS public ECR images MiniStack pulls for them:
 |---------|-------|
 | `python3.8` – `python3.14` | `public.ecr.aws/lambda/python:<version>` |
 | `nodejs14.x` – `nodejs24.x` | `public.ecr.aws/lambda/nodejs:<version>` |
-| `java8.al2`, `java11` – `java25` | `public.ecr.aws/lambda/java:<version>` |
+| `java8.al2`, `java11`, `java17`, `java21`, `java25` | `public.ecr.aws/lambda/java:<version>` |
 | `dotnet6`, `dotnet8`, `dotnet10` | `public.ecr.aws/lambda/dotnet:<version>` |
-| `ruby3.2` – `ruby4.0` | `public.ecr.aws/lambda/ruby:<version>` |
+| `ruby3.2`, `ruby3.3`, `ruby3.4`, `ruby4.0` | `public.ecr.aws/lambda/ruby:<version>` |
 | `provided.al2023` | `public.ecr.aws/lambda/provided:al2023` |
 | `provided.al2` | `public.ecr.aws/lambda/provided:al2` |
 | `provided` | `public.ecr.aws/lambda/provided:latest` |
