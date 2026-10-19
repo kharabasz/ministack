@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **CloudFront — VPC origins** — `CreateVpcOrigin`, `GetVpcOrigin`, `UpdateVpcOrigin`, `DeleteVpcOrigin` and `ListVpcOrigins` replace the empty `ListVpcOrigins` stub, so Terraform's `aws_cloudfront_vpc_origin` and a distribution's `vpc_origin_config` apply. An origin is `Deployed` as soon as it is created; updates and deletes need the current `If-Match`, a second origin for the same load balancer or instance answers `EntityAlreadyExists`, and deleting one that a distribution still names answers `CannotDeleteEntityWhileInUse`. Viewer requests are not routed to the VPC endpoint. Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

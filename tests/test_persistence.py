@@ -691,6 +691,24 @@ def test_s3_object_lambda_access_points_round_trip_without_pending_requests():
     _round_trip("s3", "s3", populate, observe)
 
 
+def test_cloudfront_vpc_origins_round_trip_every_account():
+    """CloudFront VPC origins are account-scoped; a restart keeps every account's."""
+    def record(account, vo_id):
+        return {"Id": vo_id, "Arn": f"arn:aws:cloudfront::{account}:vpcorigin/{vo_id}", "AccountId": account,
+                "Status": "Deployed", "ETag": "E1", "VpcOriginEndpointConfig": {"Name": "api"}}
+
+    def populate(mod):
+        mod._vpc_origins.set_scoped("111111111111", "us-east-1", "vo_a", record("111111111111", "vo_a"))
+        mod._vpc_origins.set_scoped("222222222222", "us-east-1", "vo_b", record("222222222222", "vo_b"))
+
+    def observe(mod):
+        assert mod._vpc_origins.get_scoped("111111111111", "us-east-1", "vo_a")["AccountId"] == "111111111111"
+        assert mod._vpc_origins.get_scoped("222222222222", "us-east-1", "vo_b")["ETag"] == "E1"
+        assert not mod._vpc_origins.contains_scoped("111111111111", "us-east-1", "vo_b")
+
+    _round_trip("cloudfront", "cloudfront", populate, observe)
+
+
 def test_transcribe_round_trip():
     import time as _time
 
