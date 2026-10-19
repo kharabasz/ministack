@@ -14564,6 +14564,19 @@ def test_execute_function_generates_one_request_id(monkeypatch, log_state, mode,
     assert emit.call_args.args[1] == "invocation-id"
 
 
+@pytest.mark.parametrize("runtime", ["dotnet8", "dotnet10"])
+def test_dotnet_zip_functions_run_in_the_official_image(monkeypatch, log_state, runtime):
+    """dotnet zip functions go to the Docker executor and the AWS base image, whatever LAMBDA_EXECUTOR says."""
+    func = _function(runtime, b"zip")
+    monkeypatch.setattr(_svc, "LAMBDA_EXECUTOR", "local")
+    monkeypatch.setattr(_svc, "LAMBDA_STRICT", False)
+    docker_exec = Mock(return_value={"body": {}, "log": ""})
+    monkeypatch.setattr(_svc, "_execute_function_docker", docker_exec)
+    _svc._execute_function_dispatch(func, func["config"], {}, "dotnet-id", time.time())
+    docker_exec.assert_called_once_with(func, {}, "dotnet-id")
+    assert _svc._RUNTIME_IMAGE_MAP[runtime] == f"public.ecr.aws/lambda/dotnet:{runtime[len('dotnet'):]}"
+
+
 @pytest.mark.parametrize("unavailable", ["sdk", "daemon"])
 @pytest.mark.parametrize("runtime,target", [
     ("python3.12", "_execute_function_warm"),
