@@ -8242,6 +8242,161 @@ def test_s3_replication_filter_round_trips_tag_and_and(s3):
     assert [r["Filter"] for r in got] == [r["Filter"] for r in rules]
 
 
+_REPL_OPTIONS_RULE = {
+    "ID": "options", "Status": "Enabled", "Priority": 1, "Filter": {"Prefix": "kms/"},
+    "DeleteMarkerReplication": {"Status": "Enabled"},
+    "SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "Enabled"},
+                                "ReplicaModifications": {"Status": "Enabled"}},
+    "ExistingObjectReplication": {"Status": "Disabled"},
+    "Destination": {
+        "Bucket": "",
+        "EncryptionConfiguration": {"ReplicaKmsKeyID": "arn:aws:kms:us-east-1:000000000000:key/replica"},
+        "ReplicationTime": {"Status": "Enabled", "Time": {"Minutes": 15}},
+        "Metrics": {"Status": "Enabled", "EventThreshold": {"Minutes": 15}},
+    },
+}
+_REPL_RULE_OPTIONS = ("SourceSelectionCriteria", "ExistingObjectReplication")
+_REPL_DEST_OPTIONS = ("EncryptionConfiguration", "ReplicationTime", "Metrics")
+
+
+def test_s3_replication_round_trips_rule_and_destination_options(s3):
+    """Each rule gets back the options it was put with, and only those: a plain
+    rule returns none of them and Metrics without EventThreshold stays bare."""
+    src, dst = _bucket(s3, versioned=True), _bucket(s3, versioned=True)
+    full = {**_REPL_OPTIONS_RULE, "Destination": {**_REPL_OPTIONS_RULE["Destination"],
+                                                  "Bucket": f"arn:aws:s3:::{dst}"}}
+    plain = {"ID": "plain", "Status": "Enabled", "Priority": 2, "Filter": {"Prefix": "plain/"},
+             "DeleteMarkerReplication": {"Status": "Disabled"}, "Destination": {"Bucket": f"arn:aws:s3:::{dst}"}}
+    metrics_only = {"ID": "metrics", "Status": "Enabled", "Priority": 3, "Filter": {"Prefix": "m/"},
+                    "DeleteMarkerReplication": {"Status": "Disabled"},
+                    "Destination": {"Bucket": f"arn:aws:s3:::{dst}", "Metrics": {"Status": "Disabled"}}}
+    try:
+        s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={
+            "Role": _REPL_ROLE, "Rules": [full, plain, metrics_only]})
+        got = {r["ID"]: r for r in s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"]}
+        for name in _REPL_RULE_OPTIONS:
+            assert got["options"][name] == full[name]
+            assert name not in got["plain"]
+        for name in _REPL_DEST_OPTIONS:
+            assert got["options"]["Destination"][name] == full["Destination"][name]
+            assert name not in got["plain"]["Destination"]
+        assert got["metrics"]["Destination"]["Metrics"] == {"Status": "Disabled"}
+        assert "ReplicationTime" not in got["metrics"]["Destination"]
+
+        # A second put replaces the configuration; options it omits are gone.
+        s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={
+            "Role": _REPL_ROLE, "Rules": [{**plain, "ID": "options"}]})
+        (rule,) = s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"]
+        assert not set(_REPL_RULE_OPTIONS) & set(rule)
+        assert not set(_REPL_DEST_OPTIONS) & set(rule["Destination"])
+    finally:
+        s3.delete_bucket_replication(Bucket=src)
+        s3.delete_bucket(Bucket=src)
+        s3.delete_bucket(Bucket=dst)
+
+
+def test_s3_replication_refuses_unknown_option_status(s3):
+    src, dst = _bucket(s3, versioned=True), _bucket(s3, versioned=True)
+    try:
+        for dest_extra, rule_extra in (
+            ({"Metrics": {"Status": "On"}}, {}),
+            ({}, {"ExistingObjectReplication": {"Status": "Yes"}}),
+        ):
+            rule = {"ID": "r", "Status": "Enabled", "Priority": 1, "Filter": {"Prefix": ""},
+                    "DeleteMarkerReplication": {"Status": "Disabled"}, **rule_extra,
+                    "Destination": {"Bucket": f"arn:aws:s3:::{dst}", **dest_extra}}
+            with pytest.raises(ClientError) as exc:
+                s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [rule]})
+            assert _code(exc) == "MalformedXML"
+        with pytest.raises(ClientError) as exc:
+            s3.get_bucket_replication(Bucket=src)
+        assert _code(exc) == "ReplicationConfigurationNotFoundError"
+    finally:
+        s3.delete_bucket(Bucket=src)
+        s3.delete_bucket(Bucket=dst)
+
+
+_REPL_OPTIONS_XML = b"""<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Role>arn:aws:iam::000000000000:role/repl</Role>
+  <Rule><ID>options</ID><Priority>1</Priority><Filter><Prefix></Prefix></Filter><Status>Enabled</Status>
+    <SourceSelectionCriteria>
+      <SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects>
+      <ReplicaModifications><Status>Disabled</Status></ReplicaModifications>
+    </SourceSelectionCriteria>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>arn:aws:s3:::repl-options-dst</Bucket>
+      <EncryptionConfiguration><ReplicaKmsKeyID>arn:aws:kms:us-east-1:000000000000:key/r</ReplicaKmsKeyID></EncryptionConfiguration>
+      <ReplicationTime><Status>Enabled</Status><Time><Minutes>15</Minutes></Time></ReplicationTime>
+      <Metrics><Status>Enabled</Status><EventThreshold><Minutes>15</Minutes></EventThreshold></Metrics>
+    </Destination>
+    <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>
+  </Rule>
+</ReplicationConfiguration>"""
+
+
+@pytest.fixture
+def replication_state(monkeypatch):
+    """A versioned bucket in fresh in-process S3 state, under account 000000000000."""
+    fresh = {"_buckets": AccountScopedDict(), "_bucket_versioning": AccountScopedDict(),
+             "_bucket_replication": AccountScopedDict()}
+    for attr, store in fresh.items():
+        monkeypatch.setattr(_s3_mod, attr, store)
+    monkeypatch.setitem(_s3_mod._PERSISTED_BUCKET_DICTS, "bucket_versioning", fresh["_bucket_versioning"])
+    monkeypatch.setitem(_s3_mod._PERSISTED_BUCKET_DICTS, "bucket_replication", fresh["_bucket_replication"])
+    with request_scope("000000000000", "us-east-1"):
+        _s3_mod._buckets["repl-options-src"] = {"objects": {}}
+        _s3_mod._bucket_versioning["repl-options-src"] = "Enabled"
+        yield "repl-options-src"
+
+
+def _replication_xml(body):
+    root = ElementTree.fromstring(body)
+    ns = {"s3": _s3_mod.S3_NS}
+    return lambda path: [el.text for el in root.findall(path, ns)]
+
+
+def test_s3_replication_options_wire_names_and_persistence(replication_state):
+    """GetBucketReplication emits the botocore member names, Minutes as an
+    integer, and the stored options survive a get_state/load round trip in the
+    account that put them."""
+    bucket = replication_state
+    assert _s3_mod._put_bucket_replication(bucket, _REPL_OPTIONS_XML)[0] == 200
+    state = _s3_mod.get_state()["bucket_replication"]
+    _s3_mod._bucket_replication.clear()
+    _s3_mod.load_persisted_state({"bucket_replication": state})
+
+    status, _headers, body = _s3_mod._get_bucket_replication(bucket)
+    assert status == 200
+    find = _replication_xml(body)
+    rule = "s3:Rule/s3:"
+    assert find(rule + "SourceSelectionCriteria/s3:SseKmsEncryptedObjects/s3:Status") == ["Enabled"]
+    assert find(rule + "SourceSelectionCriteria/s3:ReplicaModifications/s3:Status") == ["Disabled"]
+    assert find(rule + "ExistingObjectReplication/s3:Status") == ["Enabled"]
+    dest = rule + "Destination/s3:"
+    assert find(dest + "EncryptionConfiguration/s3:ReplicaKmsKeyID") == ["arn:aws:kms:us-east-1:000000000000:key/r"]
+    assert find(dest + "ReplicationTime/s3:Status") == ["Enabled"]
+    assert find(dest + "ReplicationTime/s3:Time/s3:Minutes") == ["15"]
+    assert find(dest + "Metrics/s3:EventThreshold/s3:Minutes") == ["15"]
+    assert _s3_mod._bucket_replication[bucket]["Rules"][0]["Destination"]["ReplicationTime"]["Time"] == {"Minutes": 15}
+    with request_scope("111111111111", "us-east-1"):
+        assert _s3_mod._bucket_replication.get(bucket) is None
+
+
+@pytest.mark.parametrize("broken", [
+    (b"<Metrics><Status>Enabled</Status>", b"<Metrics>"),
+    (b"<Minutes>15</Minutes></Time>", b"<Minutes>fifteen</Minutes></Time>"),
+    (b"<Time><Minutes>15</Minutes></Time>", b""),
+    (b"<SseKmsEncryptedObjects><Status>Enabled</Status>", b"<SseKmsEncryptedObjects>"),
+])
+def test_s3_replication_refuses_options_missing_required_members(replication_state, broken):
+    old, new = broken
+    body = _REPL_OPTIONS_XML.replace(old, new)
+    assert body != _REPL_OPTIONS_XML
+    status, _headers, out = _s3_mod._put_bucket_replication(replication_state, body)
+    assert status == 400 and b"<Code>MalformedXML</Code>" in out
+    assert _s3_mod._bucket_replication.get(replication_state) is None
+
+
 def test_s3_replication_config_round_trips_cross_account_fields(s3):
     """GetBucketReplication answers the cross-account fields the PUT stored."""
     src_client, dst_client, src, dst = _cross_account_pair("cfg")
