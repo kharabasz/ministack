@@ -1930,3 +1930,43 @@ def test_alb_http_header_condition_round_trips_and_matches(elbv2):
     finally:
         elbv2.delete_listener(ListenerArn=l_arn)
         elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+def test_elbv2_rule_transforms_round_trip_and_rewrite_the_path(elbv2):
+    """Rule Transforms are stored and returned, and url-rewrite changes the path the actions see."""
+    import os
+    import urllib.error as _err
+    import urllib.request as _req
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    lb_arn = elbv2.create_load_balancer(Name="dp-alb-rewrite")["LoadBalancers"][0]["LoadBalancerArn"]
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80,
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "404"}}],
+    )["Listeners"][0]["ListenerArn"]
+    transforms = [{"Type": "url-rewrite",
+                   "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/app/(.*)$", "Replace": "/$1"}]}}]
+    rule = elbv2.create_rule(
+        ListenerArn=l_arn, Priority=10,
+        Conditions=[{"Field": "path-pattern", "Values": ["/app/*"]}],
+        Actions=[{"Type": "redirect", "RedirectConfig": {
+            "Protocol": "HTTP", "Host": "example.com", "Path": "/#{path}", "StatusCode": "HTTP_302"}}],
+        Transforms=transforms,
+    )["Rules"][0]
+    assert rule["Transforms"] == transforms
+    described = elbv2.describe_rules(RuleArns=[rule["RuleArn"]])["Rules"][0]
+    assert described["Transforms"] == transforms
+
+    class _NoRedirect(_req.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    opener = _req.build_opener(_NoRedirect)
+    with pytest.raises(_err.HTTPError) as exc:
+        opener.open(f"{endpoint}/_alb/dp-alb-rewrite/app/orders/1")
+    assert exc.value.code == 302
+    assert exc.value.headers["Location"].lower() == "http://example.com/orders/1"
+
+    elbv2.modify_rule(RuleArn=rule["RuleArn"], ResetTransforms=True)
+    assert elbv2.describe_rules(RuleArns=[rule["RuleArn"]])["Rules"][0].get("Transforms", []) == []
+    elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)

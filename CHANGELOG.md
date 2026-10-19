@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **ELBv2 — listener rule transforms** — `CreateRule` and `ModifyRule` dropped `Transforms`; `url-rewrite` and `host-header-rewrite` transforms are stored, returned by `DescribeRules`, cleared by `ResetTransforms`, and applied to the path or Host header before a matched rule's actions run.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
