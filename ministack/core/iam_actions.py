@@ -31,6 +31,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "apigateway": "apigateway",
     "appconfig": "appconfig",
     "appconfigdata": "appconfig",
+    "application-autoscaling": "application-autoscaling",
     "appsync": "appsync",
     "appsync-events": "appsync",
     "athena": "athena",
@@ -1179,6 +1180,15 @@ def extract_resource_arn(service: str, method: str, path: str,
         wg = _safe_json_field(body, "WorkGroup")
         if wg:
             return f"arn:aws:athena:{region}:{account_id}:workgroup/{wg}"
+        return "*"
+
+    if service == "application-autoscaling":
+        # Only the tagging operations name the scalable target's ARN; the
+        # others address it by namespace, resource id and dimension and are
+        # evaluated against "*" (resource-level conditions are not modeled).
+        action = headers.get("x-amz-target", "").rsplit(".", 1)[-1]
+        if action in {"TagResource", "UntagResource", "ListTagsForResource"}:
+            return _safe_json_field(body, "ResourceARN") or "*"
         return "*"
 
     if service == "servicediscovery":

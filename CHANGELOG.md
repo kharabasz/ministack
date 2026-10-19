@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Application Auto Scaling — ECS service scaling** — new `application-autoscaling` service for ECS services: `RegisterScalableTarget`, `DescribeScalableTargets` and `DeregisterScalableTarget`; step and target-tracking `PutScalingPolicy`, `DescribeScalingPolicies` and `DeleteScalingPolicy`; scheduled actions; and tags on scalable targets, per account and region and paged with `MaxResults` / `NextToken`. Deregistering a target removes its policies and scheduled actions. CloudFormation creates, updates and deletes `AWS::ApplicationAutoScaling::ScalableTarget` and `AWS::ApplicationAutoScaling::ScalingPolicy`, with the documented `Ref` values. Under `AUTH=true` each operation needs its `application-autoscaling:` action. Nothing changes the service's desired count, no CloudWatch alarms are created, and other namespaces and predictive scaling answer `ValidationException` (#2162). Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
