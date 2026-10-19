@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Docs — Lambda java, dotnet and ruby zip functions need Docker** — the README now says these runtimes always use the Docker executor, what an invoke returns without Docker (a 200 placeholder body, or `Runtime.DockerUnavailable` / `Runtime.DockerError` with `LAMBDA_STRICT=1`), lists their images, and notes that a .NET zip needs its `<Assembly>.runtimeconfig.json`. Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
