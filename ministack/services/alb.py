@@ -599,9 +599,65 @@ def _condition_xml(c):
     return xml + "</member>"
 
 
+_TRANSFORM_CONFIG_KEYS = {
+    "url-rewrite": "UrlRewriteConfig",
+    "host-header-rewrite": "HostHeaderRewriteConfig",
+}
+
+
+def _parse_transforms(params, prefix="Transforms"):
+    """Rule transforms: [{"Type", "Rewrites": [{"Regex", "Replace"}]}]."""
+    transforms, i = [], 1
+    while _p(params, f"{prefix}.member.{i}.Type"):
+        t_type = _p(params, f"{prefix}.member.{i}.Type")
+        config = _TRANSFORM_CONFIG_KEYS.get(t_type, "")
+        rewrites, j = [], 1
+        base = f"{prefix}.member.{i}.{config}.Rewrites.member"
+        while _p(params, f"{base}.{j}.Regex") or _p(params, f"{base}.{j}.Replace"):
+            rewrites.append({"Regex": _p(params, f"{base}.{j}.Regex"),
+                             "Replace": _p(params, f"{base}.{j}.Replace")})
+            j += 1
+        transforms.append({"Type": t_type, "Rewrites": rewrites})
+        i += 1
+    return transforms
+
+
+def _transform_xml(t):
+    config = _TRANSFORM_CONFIG_KEYS.get(t["Type"])
+    rewrites = "".join(
+        f"<member><Regex>{_esc(r['Regex'])}</Regex><Replace>{_esc(r['Replace'])}</Replace></member>"
+        for r in t.get("Rewrites", [])
+    )
+    inner = f"<{config}><Rewrites>{rewrites}</Rewrites></{config}>" if config else ""
+    return f"<member><Type>{_esc(t['Type'])}</Type>{inner}</member>"
+
+
+def _rewrite(value, rewrite):
+    """Apply one Regex/Replace rewrite; Replace refers to capture groups as $1, $2..."""
+    try:
+        pattern = re.compile(rewrite.get("Regex", ""))
+    except re.error:
+        return value
+    replace = rewrite.get("Replace", "")
+    return pattern.sub(lambda m: re.sub(r"\$(\d+)", lambda g: m.group(int(g.group(1))) or "", replace),
+                       value, count=1)
+
+
+def _apply_transforms(transforms, path, headers):
+    """Rewrite the request path and Host header as a matched rule's transforms say."""
+    for transform in transforms:
+        for rewrite in transform.get("Rewrites", []):
+            if transform["Type"] == "url-rewrite":
+                path = _rewrite(path, rewrite)
+            elif transform["Type"] == "host-header-rewrite":
+                headers = {**headers, "host": _rewrite(headers.get("host", ""), rewrite)}
+    return path, headers
+
+
 def _rule_xml(r):
     conds = "".join(_condition_xml(c) for c in r.get("Conditions", []))
     acts = "".join(_action_xml(a) for a in r.get("Actions", []))
+    transforms = "".join(_transform_xml(t) for t in r.get("Transforms", []))
     return (
         f"<member>"
         f"<RuleArn>{r['RuleArn']}</RuleArn>"
@@ -609,6 +665,7 @@ def _rule_xml(r):
         f"<Conditions>{conds}</Conditions>"
         f"<Actions>{acts}</Actions>"
         f"<IsDefault>{str(r.get('IsDefault',False)).lower()}</IsDefault>"
+        f"{f'<Transforms>{transforms}</Transforms>' if transforms else ''}"
         f"</member>"
     )
 
@@ -1028,6 +1085,7 @@ def _create_rule(params):
         "Conditions": _parse_conditions(params),
         "Actions": _parse_actions(params, "Actions"),
         "IsDefault": False,
+        "Transforms": _parse_transforms(params),
     }
     _rules[rule_arn] = rule
     _tags[rule_arn] = _parse_tags(params)
@@ -1056,6 +1114,11 @@ def _modify_rule(params):
     acts = _parse_actions(params, "Actions")
     if acts:
         rule["Actions"] = acts
+    transforms = _parse_transforms(params)
+    if transforms:
+        rule["Transforms"] = transforms
+    elif _p(params, "ResetTransforms") == "true":
+        rule["Transforms"] = []
     return _xml(200, "ModifyRule", f"<Rules>{_rule_xml(rule)}</Rules>")
 
 
@@ -2098,6 +2161,7 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
         )
         if matched:
             actions = rule.get("Actions") or listener.get("DefaultActions", [])
+            path, headers = _apply_transforms(rule.get("Transforms", []), path, headers)
             if actions:
                 return await _execute_actions(actions, method, path,
                                               headers, body, query_params, port,
