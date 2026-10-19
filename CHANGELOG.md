@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **S3 upload errors under `AUTH=true`** — ordinary header-signed `PutObject` requests now check invalid bucket names, regional endpoint routing and signing regions before credentials, and missing buckets after authentication, matching observed AWS error precedence. The six upload errors include AWS's fixed messages, XML detail fields and matching request identifiers. Pre-authentication regional endpoint checks use `s3.<region>.<host>` hosts. Reserved root credentials and `AUTH=false` keep their existing authentication behavior; bucket home-region checks still apply.
+- **ELBv2 — listener `SslPolicy` and certificate** — `CreateListener` and `ModifyListener` dropped `SslPolicy` and `Certificates`, so `DescribeListeners` returned neither and Terraform re-planned `ssl_policy` on every HTTPS listener; HTTPS and TLS listeners now keep and return both, the policy defaults to `ELBSecurityPolicy-2016-08`, a listener moved to HTTP or TCP drops them, and more than one default certificate answers `ValidationError`. Contributed by @kharabasz.
 
 ## [1.5.29] — 2026-10-17
 
