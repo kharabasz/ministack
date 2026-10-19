@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **ELBv2 — listener TLS settings** — HTTPS/TLS listeners dropped `SslPolicy`, `Certificates` and `AlpnPolicy`, so Terraform re-planned `ssl_policy` on every run; they are stored and returned (secure listeners default to `ELBSecurityPolicy-2016-08`), and `AddListenerCertificates`, `RemoveListenerCertificates` and `DescribeListenerCertificates` manage extra certificates.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
