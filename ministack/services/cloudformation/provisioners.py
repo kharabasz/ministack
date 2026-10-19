@@ -9170,6 +9170,32 @@ def _sfn_tags(props):
     return [{"key": t.get("Key", ""), "value": t.get("Value", "")} for t in props.get("Tags") or []]
 
 
+def _sfn_encryption(cfn_encryption):
+    """A template's EncryptionConfiguration ({Type, KmsKeyId,
+    KmsDataKeyReusePeriodSeconds}) in the API's camelCase shape, checked the
+    way CreateStateMachine and UpdateStateMachine check it. An absent block
+    is the AWS_OWNED_KEY default."""
+    if not cfn_encryption:
+        return _sfn._default_encryption()
+    if not isinstance(cfn_encryption, dict):
+        raise ValueError("AWS::StepFunctions::StateMachine EncryptionConfiguration must be an object")
+    encryption = {"type": cfn_encryption.get("Type")}
+    if cfn_encryption.get("KmsKeyId") is not None:
+        encryption["kmsKeyId"] = cfn_encryption["KmsKeyId"]
+    period = cfn_encryption.get("KmsDataKeyReusePeriodSeconds")
+    if period is not None:
+        # Template values can arrive as strings (parameters, YAML).
+        try:
+            encryption["kmsDataKeyReusePeriodSeconds"] = int(period)
+        except (TypeError, ValueError):
+            encryption["kmsDataKeyReusePeriodSeconds"] = period
+    invalid = _sfn._validate_encryption_configuration(encryption)
+    if invalid:
+        raise ValueError(
+            f"AWS::StepFunctions::StateMachine EncryptionConfiguration is invalid: {invalid[2]!r}")
+    return encryption
+
+
 def _sfn_attrs(arn, name):
     """Ref is the ARN; Fn::GetAtt serves Arn, Name and StateMachineRevisionId,
     the revision the record carries (rotated by every create and update)."""
@@ -9185,14 +9211,14 @@ def _sfn_state_machine_create(logical_id, props, stack_name):
     role_arn = props.get("RoleArn", f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole")
     definition = _sfn_definition(props)
     sm_type = props.get("StateMachineType", "STANDARD")
+    encryption = _sfn_encryption(props.get("EncryptionConfiguration"))
 
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:stateMachine:{name}"
     ts = now_iso()
     # The record mirrors what CreateStateMachine writes, revision id and
     # version counter included, so versions published later behave the same
-    # for a template-created machine. TracingConfiguration and
-    # EncryptionConfiguration have no field in the store and are accepted
-    # without effect.
+    # for a template-created machine. TracingConfiguration has no field in
+    # the store and is accepted without effect.
     _sfn._state_machines[arn] = {
         "stateMachineArn": arn,
         "name": name,
@@ -9202,6 +9228,7 @@ def _sfn_state_machine_create(logical_id, props, stack_name):
         "creationDate": ts,
         "status": "ACTIVE",
         "loggingConfiguration": props.get("LoggingConfiguration", {"level": "OFF", "includeExecutionData": False}),
+        "encryptionConfiguration": encryption,
         "revisionId": new_uuid(),
         "lastVersionNumber": 0,
     }
@@ -9218,10 +9245,10 @@ def _sfn_state_machine_update(physical_id, old_props, new_props, stack_name,
     StateMachineName and StateMachineType require replacement
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-stepfunctions-statemachine.html):
     ``_update_resource`` performs it before this runs. Definition,
-    DefinitionSubstitutions, RoleArn, LoggingConfiguration and Tags update
-    without interruption;
-    TracingConfiguration and EncryptionConfiguration are accepted without
-    effect, the store has no field for them.
+    DefinitionSubstitutions, RoleArn, LoggingConfiguration,
+    EncryptionConfiguration and Tags update without interruption;
+    TracingConfiguration is accepted without effect, the store has no field
+    for it.
     """
     name = new_props.get("StateMachineName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=80
@@ -9250,6 +9277,11 @@ def _sfn_state_machine_update(physical_id, old_props, new_props, stack_name,
         "LoggingConfiguration": {"level": "OFF", "includeExecutionData": False}})
     if logging:
         data["loggingConfiguration"] = logging["LoggingConfiguration"]
+    # Same rule for EncryptionConfiguration: dropping the block reverts the
+    # machine to AWS_OWNED_KEY.
+    encryption = _declared_or_default(old_props, new_props, {"EncryptionConfiguration": None})
+    if encryption:
+        data["encryptionConfiguration"] = _sfn_encryption(encryption["EncryptionConfiguration"])
     resp = _sfn._update_state_machine(data)
     if resp[0] >= 400:
         raise ValueError(f"AWS::StepFunctions::StateMachine update failed: {resp[2]!r}")

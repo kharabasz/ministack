@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Step Functions — `encryptionConfiguration` on state machines** — `CreateStateMachine` and `UpdateStateMachine` dropped `encryptionConfiguration`, so Terraform's `aws_sfn_state_machine` showed a diff on `encryption_configuration` after every apply; it is now stored, `DescribeStateMachine` (machines, versions and aliases) and `DescribeStateMachineForExecution` return it, `{"type": "AWS_OWNED_KEY"}` when none was set, and each published version keeps the configuration it was published with. A different configuration makes a repeated `CreateStateMachine` answer `StateMachineAlreadyExists`; `CUSTOMER_MANAGED_KMS_KEY` without `kmsKeyId` or a `kmsDataKeyReusePeriodSeconds` outside 60–900 answers 400 `InvalidEncryptionConfiguration`, and `AWS::StepFunctions::StateMachine` applies `EncryptionConfiguration` on create and update. Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
