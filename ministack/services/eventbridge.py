@@ -3020,6 +3020,8 @@ def _create_archive(data):
         "EventCount": 0,
         "SizeBytes": 0,
     }
+    # Unlike event buses, an empty identifier is not stored: an archive with no
+    # customer managed key has no KmsKeyIdentifier in DescribeArchive.
     if data.get("KmsKeyIdentifier"):
         _archives[name]["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
     return json_response({"ArchiveArn": arn, "State": "ENABLED", "CreationTime": _archives[name]["CreationTime"]})
@@ -3060,7 +3062,7 @@ def _update_archive(data):
     if "RetentionDays" in data:
         archive["RetentionDays"] = int(data["RetentionDays"])
     if "KmsKeyIdentifier" in data:
-        # An empty identifier switches the archive back to an AWS owned key.
+        # An empty identifier clears the stored key.
         if data["KmsKeyIdentifier"]:
             archive["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
         else:
@@ -3086,7 +3088,7 @@ def _list_archives(data):
             continue
         if state and archive.get("State") != state:
             continue
-        results.append({k: v for k, v in archive.items() if k != "KmsKeyIdentifier"})
+        results.append(archive)
     return json_response({"Archives": results})
 
 
