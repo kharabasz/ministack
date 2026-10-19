@@ -227,7 +227,8 @@ _TOKEN_ROUTES = {
     "s3files": "s3files", "s3tables": "s3tables", "scheduler": "scheduler",
     "secretsmanager": "secretsmanager", "servicediscovery": "servicediscovery",
     "sns": "sns", "sqs": "sqs", "ssm": "ssm", "states": "states", "sts": "sts",
-    "tagging": "tagging", "transfer": "transfer", "waf": "waf", "wafv2": "wafv2",
+    "tagging": "tagging", "transfer": "transfer", "vpc-lattice": "vpc-lattice",
+    "waf": "waf", "wafv2": "wafv2",
     "waf-regional": "waf-regional",
     # multi-label tokens
     "streams.dynamodb": "dynamodbstreams", "api.ecr": "ecr",
@@ -412,6 +413,25 @@ def test_served_host_prefers_the_multi_label_token():
     assert detect_service(
         "GET", "/status", {"host": "appconfig.us-east-1.localhost:4566"}, {}
     ) == "appconfig"
+
+
+@pytest.mark.parametrize("method,path", [
+    ("POST", "/servicenetworks"),
+    ("GET", "/servicenetworks/sn-0123456789abcdefg"),
+    ("GET", "/servicenetworkvpcassociations"),
+    ("PUT", "/authpolicy/sn-0123456789abcdefg"),
+    ("POST", "/accesslogsubscriptions"),
+    ("GET", "/tags/arn:aws:vpc-lattice:us-east-1:000000000000:servicenetwork/sn-0123456789abcdefg"),
+])
+def test_vpc_lattice_credential_scope_routes(method, path):
+    """boto3 signs with credential scope `vpc-lattice` (botocore signingName)."""
+    assert detect_service(method, path, _sigv4_headers("vpc-lattice"), {}) == "vpc-lattice"
+
+
+def test_vpc_lattice_paths_without_signature_stay_off_vpc_lattice():
+    """The service has no path-prefix routing: an unsigned request for a
+    path-style S3 bucket that happens to be named like a Lattice path is S3."""
+    assert detect_service("GET", "/servicenetworks", _HEADERS, {}) == "s3"
 
 
 def test_signer_credential_scope_routes():
