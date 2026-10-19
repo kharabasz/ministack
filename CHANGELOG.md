@@ -8,7 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- **Lambda — public vendor layers** — `LAMBDA_PUBLIC_LAYER_ACCOUNTS` lists accounts whose layers are public on AWS (for example Datadog's `464622532012`); layers from those accounts that MiniStack does not hold resolve with `CodeSize` 0 instead of `AccessDeniedException`, so functions attaching them deploy (the layer does not run).
+- **Lambda — public layers from configured accounts** — `LAMBDA_PUBLIC_LAYER_ACCOUNTS` takes comma-separated 12-digit account ids whose layers are public on AWS, such as Datadog's `464622532012`. A layer version from one of those accounts that MiniStack does not hold now resolves the way an AWS-published extension does, with `CodeSize` 0 and no content, on `CreateFunction`, `UpdateFunctionConfiguration` and `GetLayerVersionByArn` instead of answering `AccessDeniedException`, so a stack attaching it deploys; the layer does not run. Layers MiniStack holds still need a grant, other accounts and other regions are still refused, and entries that are not account ids are logged and ignored. Contributed by @kharabasz.
 
 ## [1.5.29] — 2026-10-17
 
