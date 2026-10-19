@@ -7,8 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Route 53 — VPC associations for private hosted zones** — `AssociateVPCWithHostedZone`, `DisassociateVPCFromHostedZone` and `ListHostedZonesByVPC` (paged with `MaxItems` and `NextToken`). They refuse a public zone (`PublicZoneVPCAssociation`), a VPC already associated with a zone of the same name (`ConflictingDomainExists`), a VPC the zone doesn't have (404 `VPCAssociationNotFound`) and the zone's last VPC (`LastVPCAssociation`). Contributed by @kharabasz.
+
 ### Fixed
-- **Route 53 — private hosted zones keep their VPCs** — `CreateHostedZone` with a `VPC` made a public zone and dropped the VPC, so Terraform re-planned the association forever; the zone is now private, `GetHostedZone` returns its `VPCs` (and no delegation set), and `AssociateVPCWithHostedZone`, `DisassociateVPCFromHostedZone` and `ListHostedZonesByVPC` keep the list, refusing a public zone (`PublicZoneVPCAssociation`), a duplicate (`ConflictingDomainExists`), an unknown VPC (`VPCAssociationNotFound`) and the last association (`LastVPCAssociation`). Cloud Map private DNS namespaces now create their zone with the namespace's VPC.
+- **Route 53 — private hosted zones keep their VPC** — `CreateHostedZone` with a `VPC` made a public zone and dropped the VPC, so Terraform's `aws_route53_zone` with a `vpc` block planned to add it again on every run; the zone is now private, the response carries the `VPC` instead of a delegation set, also on a `CallerReference` replay, and `GetHostedZone` returns its `VPCs`. Contributed by @kharabasz.
 
 ## [1.5.29] — 2026-10-17
 
