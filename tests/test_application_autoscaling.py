@@ -262,6 +262,10 @@ def test_put_policy_again_updates_in_place(appautoscaling):
         PolicyName="cpu", ServiceNamespace="ecs", ResourceId=rid, ScalableDimension=_DIM,
         PolicyType="TargetTrackingScaling", TargetTrackingScalingPolicyConfiguration=updated_config)["PolicyARN"]
     assert second == first
+    # An update may omit PolicyType; the policy keeps its type.
+    appautoscaling.put_scaling_policy(
+        PolicyName="cpu", ServiceNamespace="ecs", ResourceId=rid, ScalableDimension=_DIM,
+        TargetTrackingScalingPolicyConfiguration=updated_config)
     policies = appautoscaling.describe_scaling_policies(ServiceNamespace="ecs", ResourceId=rid)["ScalingPolicies"]
     assert len(policies) == 1
     assert policies[0]["CreationTime"] == created
@@ -285,6 +289,7 @@ def test_step_scaling_policy_and_name_filter(appautoscaling):
 
 
 @pytest.mark.parametrize("kwargs", [
+    {"StepScalingPolicyConfiguration": _STEP},
     {"PolicyType": "TargetTrackingScaling"},
     {"PolicyType": "StepScaling"},
     {"PolicyType": "NotAType", "StepScalingPolicyConfiguration": _STEP},
