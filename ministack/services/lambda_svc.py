@@ -259,6 +259,12 @@ LAMBDA_DOCKER_FLAGS = os.environ.get("LAMBDA_DOCKER_FLAGS", "")
 # instead of silently degrading to an in-process execution that diverges from
 # real AWS semantics.
 LAMBDA_STRICT = os.environ.get("LAMBDA_STRICT", "0").lower() in ("1", "true", "yes")
+# Accounts whose layers are public on AWS (vendor extensions such as Datadog's
+# 464622532012). MiniStack cannot know which real layers are public, so layers
+# from these accounts that MiniStack does not hold resolve without content.
+LAMBDA_PUBLIC_LAYER_ACCOUNTS = frozenset(
+    a.strip() for a in os.environ.get("LAMBDA_PUBLIC_LAYER_ACCOUNTS", "").split(",") if a.strip()
+)
 
 # Lambda proxy mode: invocations are forwarded to a user-managed HTTP
 # container instead of running in ministack's worker pool. The container
@@ -1758,6 +1764,17 @@ def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version):
     vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
     if vc is not None and _layer_policy_allows(vc, get_account_id()):
         return vc, None
+    if vc is None and spec.account_id in LAMBDA_PUBLIC_LAYER_ACCOUNTS:
+        logger.warning(
+            "Layer %s is from LAMBDA_PUBLIC_LAYER_ACCOUNTS: the reference resolves "
+            "so the stack deploys, but the bytes are not available offline and the "
+            "layer will not run", layer_arn,
+        )
+        return {
+            "LayerVersionArn": layer_arn,
+            "Version": version,
+            "Content": {"CodeSize": 0},
+        }, None
     if vc is None and _is_aws_published_layer(layer_name):
         logger.warning(
             "Layer %s is an AWS-published extension: the reference resolves so "

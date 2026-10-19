@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Lambda — public vendor layers** — `LAMBDA_PUBLIC_LAYER_ACCOUNTS` lists accounts whose layers are public on AWS (for example Datadog's `464622532012`); layers from those accounts that MiniStack does not hold resolve with `CodeSize` 0 instead of `AccessDeniedException`, so functions attaching them deploy (the layer does not run).
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
