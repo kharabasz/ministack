@@ -1401,12 +1401,16 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "cloudfront":
-        # REST: /2020-05-31/distribution/{id}
+        # REST: /2020-05-31/distribution/{id}, /2020-05-31/vpc-origin/{id}
         parts = [p for p in path.split("/") if p]
         if "distribution" in parts:
             di = parts.index("distribution")
             if di + 1 < len(parts):
                 return f"arn:aws:cloudfront::{account_id}:distribution/{parts[di + 1]}"
+        if "vpc-origin" in parts:
+            vi = parts.index("vpc-origin")
+            if vi + 1 < len(parts):
+                return f"arn:aws:cloudfront::{account_id}:vpcorigin/{parts[vi + 1]}"
         return "*"
 
     if service in ("cognito-idp", "cognito_idp"):
