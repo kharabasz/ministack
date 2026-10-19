@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import time
 import urllib.request as _req
 import uuid as _uuid_mod
@@ -1932,41 +1933,166 @@ def test_alb_http_header_condition_round_trips_and_matches(elbv2):
         elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
 
 
-def test_elbv2_rule_transforms_round_trip_and_rewrite_the_path(elbv2):
-    """Rule Transforms are stored and returned, and url-rewrite changes the path the actions see."""
-    import os
-    import urllib.error as _err
-    import urllib.request as _req
+def _url_rewrite(regex="^/app/(.*)$", replace="/$1"):
+    return {"Type": "url-rewrite",
+            "UrlRewriteConfig": {"Rewrites": [{"Regex": regex, "Replace": replace}]}}
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
-    lb_arn = elbv2.create_load_balancer(Name="dp-alb-rewrite")["LoadBalancers"][0]["LoadBalancerArn"]
+
+def _host_rewrite(regex="^www\\.example\\.com$", replace="internal.example.com"):
+    return {"Type": "host-header-rewrite",
+            "HostHeaderRewriteConfig": {"Rewrites": [{"Regex": regex, "Replace": replace}]}}
+
+
+@pytest.fixture
+def transform_listener(elbv2):
+    """A load balancer and listener for rule-transform tests, torn down afterwards."""
+    name = f"tx-{_uuid_mod.uuid4().hex[:8]}"
+    lb_arn = elbv2.create_load_balancer(Name=name)["LoadBalancers"][0]["LoadBalancerArn"]
     l_arn = elbv2.create_listener(
         LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80,
         DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "404"}}],
     )["Listeners"][0]["ListenerArn"]
-    transforms = [{"Type": "url-rewrite",
-                   "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/app/(.*)$", "Replace": "/$1"}]}}]
-    rule = elbv2.create_rule(
-        ListenerArn=l_arn, Priority=10,
+    try:
+        yield l_arn
+    finally:
+        for rule in elbv2.describe_rules(ListenerArn=l_arn)["Rules"]:
+            if not rule["IsDefault"]:
+                elbv2.delete_rule(RuleArn=rule["RuleArn"])
+        elbv2.delete_listener(ListenerArn=l_arn)
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+def _transform_rule(elbv2, l_arn, priority=10, **kwargs):
+    return elbv2.create_rule(
+        ListenerArn=l_arn, Priority=priority,
         Conditions=[{"Field": "path-pattern", "Values": ["/app/*"]}],
-        Actions=[{"Type": "redirect", "RedirectConfig": {
-            "Protocol": "HTTP", "Host": "example.com", "Path": "/#{path}", "StatusCode": "HTTP_302"}}],
-        Transforms=transforms,
+        Actions=[{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "200"}}],
+        **kwargs,
     )["Rules"][0]
-    assert rule["Transforms"] == transforms
-    described = elbv2.describe_rules(RuleArns=[rule["RuleArn"]])["Rules"][0]
-    assert described["Transforms"] == transforms
 
-    class _NoRedirect(_req.HTTPRedirectHandler):
-        def redirect_request(self, *args, **kwargs):
-            return None
 
-    opener = _req.build_opener(_NoRedirect)
-    with pytest.raises(_err.HTTPError) as exc:
-        opener.open(f"{endpoint}/_alb/dp-alb-rewrite/app/orders/1")
-    assert exc.value.code == 302
-    assert exc.value.headers["Location"].lower() == "http://example.com/orders/1"
+def _described_rule(elbv2, rule_arn):
+    return elbv2.describe_rules(RuleArns=[rule_arn])["Rules"][0]
+
+
+def test_elbv2_rule_transforms_are_stored_returned_replaced_and_reset(elbv2, transform_listener):
+    """CreateRule keeps both transform types, DescribeRules returns them, ModifyRule
+    replaces the whole set, and ResetTransforms clears it."""
+    both = [_url_rewrite(), _host_rewrite()]
+    rule = _transform_rule(elbv2, transform_listener, Transforms=both)
+    assert rule["Transforms"] == both
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == both
+
+    # An empty Replace is allowed (the Terraform provider permits 0-1024 characters).
+    replacement = [_url_rewrite(regex="^/app/legacy$", replace="")]
+    modified = elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=replacement)["Rules"][0]
+    assert modified["Transforms"] == replacement
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == replacement
+
+    # A ModifyRule without Transforms leaves them alone.
+    elbv2.modify_rule(RuleArn=rule["RuleArn"],
+                      Conditions=[{"Field": "path-pattern", "Values": ["/v2/*"]}])
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == replacement
 
     elbv2.modify_rule(RuleArn=rule["RuleArn"], ResetTransforms=True)
-    assert elbv2.describe_rules(RuleArns=[rule["RuleArn"]])["Rules"][0].get("Transforms", []) == []
-    elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == []
+
+
+def test_elbv2_rules_without_transforms_return_an_empty_list(elbv2, transform_listener):
+    rule = _transform_rule(elbv2, transform_listener)
+    assert rule["Transforms"] == []
+    default = next(r for r in elbv2.describe_rules(ListenerArn=transform_listener)["Rules"]
+                   if r["IsDefault"])
+    assert default["Transforms"] == []
+
+
+@pytest.mark.parametrize("transforms, message", [
+    ([{"Type": "path-rewrite",
+       "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$", "Replace": "/b"}]}}], "not valid"),
+    ([_url_rewrite(), _url_rewrite(regex="^/b$")], "only one 'url-rewrite'"),
+    ([{"Type": "url-rewrite"}], "exactly one rewrite"),
+    ([{**_url_rewrite(), "HostHeaderRewriteConfig": {"Rewrites": [{"Regex": "^a$", "Replace": "b"}]}}],
+     "can't be specified"),
+    ([{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [
+        {"Regex": "^/a$", "Replace": "/b"}, {"Regex": "^/c$", "Replace": "/d"}]}}],
+     "exactly one rewrite"),
+    ([{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": []}}], "exactly one rewrite"),
+    ([_url_rewrite(regex="")], "Regex must be"),
+    ([_url_rewrite(regex="a" * 1025)], "Regex must be"),
+    ([_url_rewrite(replace="a" * 1025)], "Replace must be"),
+], ids=["unknown-type", "duplicate-type", "missing-config", "wrong-config",
+        "two-rewrites", "no-rewrites", "empty-regex", "long-regex", "long-replace"])
+def test_elbv2_invalid_rule_transforms_are_rejected(transform_listener, transforms, message):
+    """Invalid transforms fail CreateRule and ModifyRule with a ValidationError and
+    leave the rule unchanged. The checks follow the botocore model, the AWS rule
+    transform docs and the Terraform provider; the error code is inferred."""
+    from conftest import make_client
+
+    # Client-side validation would stop some of these before they reach the server.
+    elbv2 = make_client("elbv2", {"parameter_validation": False})
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(elbv2, transform_listener, Transforms=transforms)
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert message in exc.value.response["Error"]["Message"]
+    assert [r for r in elbv2.describe_rules(ListenerArn=transform_listener)["Rules"]
+            if not r["IsDefault"]] == []
+
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite()])
+    with pytest.raises(ClientError) as exc:
+        elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=transforms)
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == [_url_rewrite()]
+
+
+def test_elbv2_modify_rule_refuses_transforms_with_reset_transforms(elbv2, transform_listener):
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite()])
+    with pytest.raises(ClientError) as exc:
+        elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=[_host_rewrite()],
+                          ResetTransforms=True)
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert "ResetTransforms" in exc.value.response["Error"]["Message"]
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == [_url_rewrite()]
+
+
+def test_elbv2_default_rule_takes_no_transforms(elbv2, transform_listener):
+    default = next(r for r in elbv2.describe_rules(ListenerArn=transform_listener)["Rules"]
+                   if r["IsDefault"])
+    with pytest.raises(ClientError) as exc:
+        elbv2.modify_rule(RuleArn=default["RuleArn"], Transforms=[_url_rewrite()])
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert "default rule" in exc.value.response["Error"]["Message"]
+    assert _described_rule(elbv2, default["RuleArn"])["Transforms"] == []
+
+
+def test_elbv2_rule_transforms_survive_a_state_round_trip(monkeypatch, tmp_path):
+    """Rules persist as dicts, so their Transforms come back after a save and restore."""
+    from ministack.core import persistence
+    from ministack.services import alb
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    alb.reset()
+    try:
+        lb_arn = re.search(rb"<LoadBalancerArn>([^<]+)", alb._create_lb(
+            {"Name": ["persist-tx"]})[2]).group(1).decode()
+        l_arn = re.search(rb"<ListenerArn>([^<]+)", alb._create_listener(
+            {"LoadBalancerArn": [lb_arn], "Port": ["80"]})[2]).group(1).decode()
+        prefix = "Transforms.member.1.UrlRewriteConfig.Rewrites.member.1"
+        status, _, body = alb._create_rule({
+            "ListenerArn": [l_arn], "Priority": ["5"],
+            "Transforms.member.1.Type": ["url-rewrite"],
+            f"{prefix}.Regex": ["^/app/(.*)$"], f"{prefix}.Replace": ["/$1"],
+        })
+        assert status == 200, body
+        rule_arn = re.search(rb"<RuleArn>([^<]+)", body).group(1).decode()
+
+        persistence.save_state("alb", alb.get_state())
+        alb.reset()
+        alb.load_persisted_state(persistence.load_state("alb"))
+
+        assert alb._rules[rule_arn]["Transforms"] == [
+            {"Type": "url-rewrite",
+             "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/app/(.*)$", "Replace": "/$1"}]}},
+        ]
+    finally:
+        alb.reset()

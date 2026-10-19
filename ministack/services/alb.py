@@ -556,59 +556,95 @@ def _condition_xml(c):
     return xml + "</member>"
 
 
+# Rule transforms (https://docs.aws.amazon.com/elasticloadbalancing/latest/application/rule-transforms.html).
+# They are stored and returned in the RuleTransform shape of the botocore model.
+# The data plane does not apply them: requests reach targets unrewritten.
 _TRANSFORM_CONFIG_KEYS = {
     "url-rewrite": "UrlRewriteConfig",
     "host-header-rewrite": "HostHeaderRewriteConfig",
 }
+_REWRITE_MAX_LEN = 1024
 
 
 def _parse_transforms(params, prefix="Transforms"):
-    """Rule transforms: [{"Type", "Rewrites": [{"Regex", "Replace"}]}]."""
-    transforms, i = [], 1
-    while _p(params, f"{prefix}.member.{i}.Type"):
-        t_type = _p(params, f"{prefix}.member.{i}.Type")
-        config = _TRANSFORM_CONFIG_KEYS.get(t_type, "")
-        rewrites, j = [], 1
-        base = f"{prefix}.member.{i}.{config}.Rewrites.member"
-        while _p(params, f"{base}.{j}.Regex") or _p(params, f"{base}.{j}.Replace"):
-            rewrites.append({"Regex": _p(params, f"{base}.{j}.Regex"),
-                             "Replace": _p(params, f"{base}.{j}.Replace")})
-            j += 1
-        transforms.append({"Type": t_type, "Rewrites": rewrites})
-        i += 1
+    """Read Transforms.member.N from Query params into
+    [{"Type", "UrlRewriteConfig"|"HostHeaderRewriteConfig": {"Rewrites": [{"Regex", "Replace"}]}}].
+    Returns None when the request carries no Transforms."""
+    members = {}
+    head = re.compile(rf"^{re.escape(prefix)}\.member\.(\d+)\.(.+)$")
+    for key in params:
+        m = head.match(key)
+        if m:
+            members.setdefault(int(m.group(1)), {})[m.group(2)] = _p(params, key)
+    if not members:
+        return None
+    transforms = []
+    for i in sorted(members):
+        fields = members[i]
+        transform = {"Type": fields.get("Type", "")}
+        for config in _TRANSFORM_CONFIG_KEYS.values():
+            rewrites = {}
+            rw = re.compile(rf"^{config}\.Rewrites\.member\.(\d+)\.(Regex|Replace)$")
+            for field, value in fields.items():
+                m = rw.match(field)
+                if m:
+                    rewrites.setdefault(int(m.group(1)), {})[m.group(2)] = value
+            if rewrites or any(f.startswith(f"{config}.") for f in fields):
+                # parse_qs drops blank values, so an empty Replace arrives as a missing key.
+                transform[config] = {"Rewrites": [
+                    {"Regex": rewrites[j].get("Regex", ""), "Replace": rewrites[j].get("Replace", "")}
+                    for j in sorted(rewrites)
+                ]}
+        transforms.append(transform)
     return transforms
 
 
-def _transform_xml(t):
-    config = _TRANSFORM_CONFIG_KEYS.get(t["Type"])
-    rewrites = "".join(
-        f"<member><Regex>{_esc(r['Regex'])}</Regex><Replace>{_esc(r['Replace'])}</Replace></member>"
-        for r in t.get("Rewrites", [])
-    )
-    inner = f"<{config}><Rewrites>{rewrites}</Rewrites></{config}>" if config else ""
-    return f"<member><Type>{_esc(t['Type'])}</Type>{inner}</member>"
+def _transforms_problem(transforms):
+    """Return why a list of transforms is invalid, or None when it is valid.
 
-
-def _rewrite(value, rewrite):
-    """Apply one Regex/Replace rewrite; Replace refers to capture groups as $1, $2..."""
-    try:
-        pattern = re.compile(rewrite.get("Regex", ""))
-    except re.error:
-        return value
-    replace = rewrite.get("Replace", "")
-    return pattern.sub(lambda m: re.sub(r"\$(\d+)", lambda g: m.group(int(g.group(1))) or "", replace),
-                       value, count=1)
-
-
-def _apply_transforms(transforms, path, headers):
-    """Rewrite the request path and Host header as a matched rule's transforms say."""
+    One transform per type, and a Type-specific config only, come from the AWS
+    rule transform docs and the botocore model. Exactly one rewrite per
+    transform comes from the Terraform AWS provider, which notes the API takes
+    one. Regex is required (1-1024 characters) and Replace may be empty (up to
+    1024), per the botocore model and the provider's validation. The error code
+    and messages are inferred, not captured from AWS.
+    """
+    seen = set()
     for transform in transforms:
-        for rewrite in transform.get("Rewrites", []):
-            if transform["Type"] == "url-rewrite":
-                path = _rewrite(path, rewrite)
-            elif transform["Type"] == "host-header-rewrite":
-                headers = {**headers, "host": _rewrite(headers.get("host", ""), rewrite)}
-    return path, headers
+        t_type = transform.get("Type", "")
+        config = _TRANSFORM_CONFIG_KEYS.get(t_type)
+        if not config:
+            return (f"Transform type '{t_type}' is not valid; "
+                    "use 'host-header-rewrite' or 'url-rewrite'.")
+        if t_type in seen:
+            return f"A rule can have only one '{t_type}' transform."
+        seen.add(t_type)
+        other = [c for c in _TRANSFORM_CONFIG_KEYS.values() if c != config and c in transform]
+        if other:
+            return f"{other[0]} can't be specified for a '{t_type}' transform."
+        rewrites = (transform.get(config) or {}).get("Rewrites") or []
+        if len(rewrites) != 1:
+            return f"A '{t_type}' transform must have exactly one rewrite in {config}."
+        regex = str(rewrites[0].get("Regex") or "")
+        replace = str(rewrites[0].get("Replace") or "")
+        if not regex or len(regex) > _REWRITE_MAX_LEN:
+            return f"Regex must be between 1 and {_REWRITE_MAX_LEN} characters."
+        if len(replace) > _REWRITE_MAX_LEN:
+            return f"Replace must be at most {_REWRITE_MAX_LEN} characters."
+    return None
+
+
+def _transform_xml(t):
+    inner = ""
+    for config in _TRANSFORM_CONFIG_KEYS.values():
+        if config in t:
+            rewrites = "".join(
+                f"<member><Regex>{_esc(r.get('Regex', ''))}</Regex>"
+                f"<Replace>{_esc(r.get('Replace', ''))}</Replace></member>"
+                for r in t[config].get("Rewrites", [])
+            )
+            inner += f"<{config}><Rewrites>{rewrites}</Rewrites></{config}>"
+    return f"<member><Type>{_esc(t['Type'])}</Type>{inner}</member>"
 
 
 def _rule_xml(r):
@@ -622,7 +658,7 @@ def _rule_xml(r):
         f"<Conditions>{conds}</Conditions>"
         f"<Actions>{acts}</Actions>"
         f"<IsDefault>{str(r.get('IsDefault',False)).lower()}</IsDefault>"
-        f"{f'<Transforms>{transforms}</Transforms>' if transforms else ''}"
+        f"<Transforms>{transforms}</Transforms>"
         f"</member>"
     )
 
@@ -986,6 +1022,10 @@ def _create_rule(params):
     l_arn = _p(params, "ListenerArn")
     if l_arn not in _listeners:
         return _error("ListenerNotFound", f"Listener '{l_arn}' not found.")
+    transforms = _parse_transforms(params)
+    problem = _transforms_problem(transforms or [])
+    if problem:
+        return _error("ValidationError", problem)
     listener = _listeners[l_arn]
     lb_arn = listener["LoadBalancerArn"]
     lb_name = _lbs[lb_arn]["LoadBalancerName"]
@@ -1000,7 +1040,7 @@ def _create_rule(params):
         "Conditions": _parse_conditions(params),
         "Actions": _parse_actions(params, "Actions"),
         "IsDefault": False,
-        "Transforms": _parse_transforms(params),
+        "Transforms": transforms or [],
     }
     _rules[rule_arn] = rule
     _tags[rule_arn] = _parse_tags(params)
@@ -1023,16 +1063,28 @@ def _modify_rule(params):
     rule = _rules.get(arn)
     if not rule:
         return _error("RuleNotFound", f"Rule '{arn}' not found.")
+    # Transforms and ResetTransforms are mutually exclusive (botocore model), and a
+    # default rule takes no transforms (AWS rule transform docs). Error codes are inferred.
+    transforms = _parse_transforms(params)
+    reset_transforms = _p(params, "ResetTransforms").lower() == "true"
+    if transforms is not None:
+        if reset_transforms:
+            return _error("ValidationError",
+                          "You can't specify both Transforms and ResetTransforms.")
+        if rule.get("IsDefault"):
+            return _error("ValidationError", "You can't add a transform to a default rule.")
+        problem = _transforms_problem(transforms)
+        if problem:
+            return _error("ValidationError", problem)
     conds = _parse_conditions(params)
     if conds:
         rule["Conditions"] = conds
     acts = _parse_actions(params, "Actions")
     if acts:
         rule["Actions"] = acts
-    transforms = _parse_transforms(params)
-    if transforms:
+    if transforms is not None:
         rule["Transforms"] = transforms
-    elif _p(params, "ResetTransforms") == "true":
+    elif reset_transforms:
         rule["Transforms"] = []
     return _xml(200, "ModifyRule", f"<Rules>{_rule_xml(rule)}</Rules>")
 
@@ -2073,7 +2125,6 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
         )
         if matched:
             actions = rule.get("Actions") or listener.get("DefaultActions", [])
-            path, headers = _apply_transforms(rule.get("Transforms", []), path, headers)
             if actions:
                 return await _execute_actions(actions, method, path,
                                               headers, body, query_params, port,
