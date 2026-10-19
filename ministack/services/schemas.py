@@ -12,9 +12,19 @@ Supports:
                DeleteSchema, ListSchemas, ListSchemaVersions
   Tags:        TagResource, UntagResource, ListTagsForResource
 
-Not emulated: schema discovery, code bindings, resource policies, search.
+Evidence: routes, status codes, member names, the Type enum and the
+Description/Content length limits come from the botocore model. The
+ConflictException/NotFoundException answers of CreateSchema, the cascade of
+DeleteRegistry, the versioning rule of UpdateSchema (a byte-for-byte change of
+Content, or a change of Type) and the error messages are inferred; none of it
+was checked against AWS.
+
+Not emulated: schema discovery, code bindings, resource policies, search,
+DeleteSchemaVersion, AWS-provided registries (Scope=AWS lists nothing), and
+the extra schemas:TagResource check AWS makes when Create* carries tags.
 """
 
+import base64
 import copy
 import json
 import re
@@ -32,7 +42,8 @@ _schemas = AccountRegionScopedDict()     # "registry/schema" -> schema record wi
 _tags = AccountRegionScopedDict()        # ARN -> {key: value}
 
 _SCHEMA_TYPES = ("OpenApi3", "JSONSchemaDraft4")
-_NAME_RE = re.compile(r"^[\.\-_A-Za-z@0-9]+$")
+_DESCRIPTION_MAX = 256    # __stringMin0Max256 in the botocore model
+_CONTENT_MAX = 100000     # __stringMin1Max100000 in the botocore model
 
 
 def reset():
@@ -94,16 +105,68 @@ def _set_tags(arn, tags):
         _tags[arn] = merged
 
 
+def _bad_request(message):
+    return _error(400, "BadRequestException", message)
+
+
+def _validate_description(body):
+    description = body.get("Description")
+    if description is not None and (not isinstance(description, str) or len(description) > _DESCRIPTION_MAX):
+        return _bad_request(f"Description must be a string of at most {_DESCRIPTION_MAX} characters")
+    return None
+
+
 def _validate_content(schema_type, content):
     if schema_type not in _SCHEMA_TYPES:
-        return _error(400, "BadRequestException", f"Type must be one of {', '.join(_SCHEMA_TYPES)}")
-    if not content:
-        return _error(400, "BadRequestException", "Content is required")
+        return _bad_request(f"Type must be one of {', '.join(_SCHEMA_TYPES)}")
+    if not content or not isinstance(content, str):
+        return _bad_request("Content is required")
+    if len(content) > _CONTENT_MAX:
+        return _bad_request(f"Content must be at most {_CONTENT_MAX} characters")
     try:
         json.loads(content)
     except (TypeError, ValueError):
-        return _error(400, "BadRequestException", "Content must be a JSON document")
+        return _bad_request("Content must be a JSON document")
     return None
+
+
+def _encode_token(offset):
+    return base64.urlsafe_b64encode(str(offset).encode()).decode()
+
+
+def _paginate(items, query):
+    """Slice a name-ordered list by the limit/nextToken query parameters."""
+    start = 0
+    token = query.get("nextToken")
+    if token:
+        try:
+            start = int(base64.urlsafe_b64decode(token.encode()).decode())
+        except (ValueError, UnicodeDecodeError):
+            return None, None, _bad_request("Invalid nextToken")
+        if start < 0:
+            return None, None, _bad_request("Invalid nextToken")
+    limit = query.get("limit")
+    if limit in (None, ""):
+        end = len(items)
+    else:
+        try:
+            end = start + int(limit)
+        except ValueError:
+            return None, None, _bad_request("limit must be an integer")
+        if int(limit) < 1:
+            return None, None, _bad_request("limit must be a positive integer")
+    page = items[start:end]
+    return page, (_encode_token(end) if end < len(items) else None), None
+
+
+def _page_response(key, items, query):
+    page, token, err = _paginate(items, query)
+    if err:
+        return err
+    out = {key: page}
+    if token:
+        out["NextToken"] = token
+    return _json(200, out)
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +184,9 @@ def _registry_view(reg):
 
 
 def _create_registry(name, body):
-    if not _NAME_RE.match(name) or len(name) > 64:
-        return _error(400, "BadRequestException", f"Invalid registry name: {name}")
+    err = _validate_description(body)
+    if err:
+        return err
     if name in _registries:
         return _error(409, "ConflictException", f"Registry with name {name} already exists.")
     reg = {"RegistryName": name, "RegistryArn": _registry_arn(name), "Description": body.get("Description", "")}
@@ -142,6 +206,9 @@ def _update_registry(name, body):
     reg = _registries.get(name)
     if not reg:
         return _not_found(f"Registry with name {name} does not exist.")
+    err = _validate_description(body)
+    if err:
+        return err
     if "Description" in body:
         reg["Description"] = body["Description"]
     return _json(200, _registry_view(reg))
@@ -151,7 +218,7 @@ def _delete_registry(name):
     reg = _registries.get(name)
     if not reg:
         return _not_found(f"Registry with name {name} does not exist.")
-    # AWS deletes the registry's schemas with it.
+    # Inference: the registry's schemas and their tags go with it.
     for key in [k for k in _schemas.keys() if k.startswith(f"{name}/")]:
         _tags.pop(_schemas[key]["SchemaArn"], None)
         _schemas.pop(key, None)
@@ -161,12 +228,17 @@ def _delete_registry(name):
 
 
 def _list_registries(query):
+    scope = (query.get("scope") or "").upper()
+    if scope not in ("", "LOCAL", "AWS"):
+        return _bad_request("scope must be Local or AWS")
     prefix = query.get("registryNamePrefix", "")
+    # Only customer (Local) registries exist here; AWS-provided ones are not emulated.
+    registries = [] if scope == "AWS" else sorted(_registries.values(), key=lambda r: r["RegistryName"])
     items = [
         {"RegistryName": r["RegistryName"], "RegistryArn": r["RegistryArn"], "tags": _tags.get(r["RegistryArn"], {})}
-        for r in _registries.values() if r["RegistryName"].startswith(prefix)
+        for r in registries if r["RegistryName"].startswith(prefix)
     ]
-    return _json(200, {"Registries": items})
+    return _page_response("Registries", items, query)
 
 
 # ---------------------------------------------------------------------------
@@ -194,12 +266,10 @@ def _schema_view(schema, version=None, include_content=True):
 def _create_schema(registry, name, body):
     if registry not in _registries:
         return _not_found(f"Registry with name {registry} does not exist.")
-    if not _NAME_RE.match(name) or len(name) > 385:
-        return _error(400, "BadRequestException", f"Invalid schema name: {name}")
     key = f"{registry}/{name}"
     if key in _schemas:
         return _error(409, "ConflictException", f"Schema with name {name} already exists.")
-    err = _validate_content(body.get("Type"), body.get("Content"))
+    err = _validate_content(body.get("Type"), body.get("Content")) or _validate_description(body)
     if err:
         return err
     now = _now()
@@ -246,13 +316,14 @@ def _update_schema(registry, name, body):
     latest = schema["Versions"][-1]
     schema_type = body.get("Type", latest["Type"])
     content = body.get("Content", latest["Content"])
-    err = _validate_content(schema_type, content)
+    err = _validate_content(schema_type, content) or _validate_description(body)
     if err:
         return err
     now = _now()
     if "Description" in body:
         schema["Description"] = body["Description"]
-    # A new version only when the content or type changes.
+    # Inference: a new version only when Content differs byte for byte from
+    # the latest version, or Type changes; a Description-only update keeps it.
     if content != latest["Content"] or schema_type != latest["Type"]:
         schema["Versions"].append({"SchemaVersion": str(len(schema["Versions"]) + 1), "Type": schema_type,
                                    "Content": content, "VersionCreatedDate": now})
@@ -276,19 +347,19 @@ def _list_schemas(registry, query):
     items = [
         {"SchemaName": s["SchemaName"], "SchemaArn": s["SchemaArn"], "LastModified": s["LastModified"],
          "VersionCount": len(s["Versions"]), "tags": _tags.get(s["SchemaArn"], {})}
-        for s in _schemas.values()
+        for s in sorted(_schemas.values(), key=lambda s: s["SchemaName"])
         if s["RegistryName"] == registry and s["SchemaName"].startswith(prefix)
     ]
-    return _json(200, {"Schemas": items})
+    return _page_response("Schemas", items, query)
 
 
-def _list_schema_versions(registry, name):
+def _list_schema_versions(registry, name, query):
     schema, err = _find_schema(registry, name)
     if err:
         return err
     items = [{"SchemaName": schema["SchemaName"], "SchemaArn": schema["SchemaArn"],
               "SchemaVersion": v["SchemaVersion"], "Type": v["Type"]} for v in schema["Versions"]]
-    return _json(200, {"SchemaVersions": items})
+    return _page_response("SchemaVersions", items, query)
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +419,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     try:
         body = json.loads(body_bytes) if body_bytes else {}
     except json.JSONDecodeError:
-        return _error(400, "BadRequestException", "Request body is not valid JSON")
+        return _bad_request("Request body is not valid JSON")
     query = {k: (v[0] if isinstance(v, list) and v else v) for k, v in query_params.items()}
 
     if path == "/v1/registries" and method == "GET":
@@ -380,7 +451,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return _delete_schema(registry, name)
     m = _VERSIONS_PATH.match(path)
     if m and method == "GET":
-        return _list_schema_versions(unquote(m.group(1)), unquote(m.group(2)))
+        return _list_schema_versions(unquote(m.group(1)), unquote(m.group(2)), query)
 
     if path.startswith("/tags/"):
         arn = unquote(path[len("/tags/"):])
@@ -394,4 +465,4 @@ async def handle_request(method, path, headers, body_bytes, query_params):
                 keys = [keys]
             return _untag_resource(arn, keys)
 
-    return _error(400, "BadRequestException", f"No route for {method} {path}")
+    return _bad_request(f"No route for {method} {path}")
