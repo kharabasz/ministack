@@ -11,6 +11,7 @@ import logging
 import os
 import time
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as _xml_escape
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -282,7 +283,8 @@ async def _create_namespace(data):
 
     soa = ((data.get("Properties") or {}).get("DnsProperties") or {}).get("SOA") or {}
     namespace, err = _create_namespace_record(
-        ns_name, ns_type, data.get("Description"), data.get("Tags", []), soa.get("TTL")
+        ns_name, ns_type, data.get("Description"), data.get("Tags", []), soa.get("TTL"),
+        vpc_id=data.get("Vpc") if ns_type == "DNS_PRIVATE" else None,
     )
     if err:
         return err
@@ -291,7 +293,7 @@ async def _create_namespace(data):
     return json_response({"OperationId": op_id})
 
 
-def _create_namespace_record(name, ns_type, description=None, tags=None, soa_ttl=None):
+def _create_namespace_record(name, ns_type, description=None, tags=None, soa_ttl=None, vpc_id=None):
     """Create a namespace and, for a DNS type, its hosted zone. Returns
     (namespace, None), or (None, error response) for the caller to return.
     Synchronous so the CloudFormation provisioners can call it."""
@@ -318,6 +320,7 @@ def _create_namespace_record(name, ns_type, description=None, tags=None, soa_ttl
                 <Comment>Created by Cloud Map</Comment>
                 <PrivateZone>{"true" if ns_type == "DNS_PRIVATE" else "false"}</PrivateZone>
             </HostedZoneConfig>
+            {f"<VPC><VPCRegion>{get_region()}</VPCRegion><VPCId>{_xml_escape(vpc_id)}</VPCId></VPC>" if vpc_id else ""}
         </CreateHostedZoneRequest>"""
 
         status, _, body = route53._create_hosted_zone(xml_body.encode("utf-8"), {})
