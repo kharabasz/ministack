@@ -1930,3 +1930,41 @@ def test_alb_http_header_condition_round_trips_and_matches(elbv2):
     finally:
         elbv2.delete_listener(ListenerArn=l_arn)
         elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+def test_elbv2_https_listener_tls_settings_and_certificates(elbv2):
+    """HTTPS listeners keep SslPolicy, the default certificate and ALPN; extra certificates round-trip."""
+    lb_arn = elbv2.create_load_balancer(Name="qa-alb-tls")["LoadBalancers"][0]["LoadBalancerArn"]
+    cert = "arn:aws:acm:us-east-1:000000000000:certificate/default"
+    extra = "arn:aws:acm:us-east-1:000000000000:certificate/extra"
+    action = [{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "404", "ContentType": "text/plain"}}]
+    listener = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+        SslPolicy="ELBSecurityPolicy-TLS13-1-2-2021-06",
+        Certificates=[{"CertificateArn": cert}], AlpnPolicy=["HTTP2Preferred"], DefaultActions=action,
+    )["Listeners"][0]
+    l_arn = listener["ListenerArn"]
+    assert listener["SslPolicy"] == "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    assert listener["Certificates"] == [{"CertificateArn": cert}]
+    assert listener["AlpnPolicy"] == ["HTTP2Preferred"]
+    described = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+    assert described["SslPolicy"] == "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    assert described["Certificates"] == [{"CertificateArn": cert}]
+
+    elbv2.add_listener_certificates(ListenerArn=l_arn, Certificates=[{"CertificateArn": extra}])
+    certs = elbv2.describe_listener_certificates(ListenerArn=l_arn)["Certificates"]
+    assert {(c["CertificateArn"], c["IsDefault"]) for c in certs} == {(cert, True), (extra, False)}
+    elbv2.remove_listener_certificates(ListenerArn=l_arn, Certificates=[{"CertificateArn": extra}])
+    assert [c["CertificateArn"] for c in elbv2.describe_listener_certificates(ListenerArn=l_arn)["Certificates"]] == [cert]
+
+    elbv2.modify_listener(ListenerArn=l_arn, SslPolicy="ELBSecurityPolicy-2016-08")
+    assert elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]["SslPolicy"] == "ELBSecurityPolicy-2016-08"
+
+    default_policy = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=8443,
+        Certificates=[{"CertificateArn": cert}], DefaultActions=action,
+    )["Listeners"][0]
+    assert default_policy["SslPolicy"]
+    plain = elbv2.create_listener(LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80, DefaultActions=action)["Listeners"][0]
+    assert "SslPolicy" not in plain
+    elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
