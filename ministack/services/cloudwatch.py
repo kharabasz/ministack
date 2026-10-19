@@ -985,7 +985,7 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "ExtendedStatistic": cbor_data.get("ExtendedStatistic"),
             "Period": int(cbor_data.get("Period", 60)),
             "EvaluationPeriods": int(cbor_data.get("EvaluationPeriods", 1)),
-            "DatapointsToAlarm": cbor_data.get("DatapointsToAlarm"),
+            "DatapointsToAlarm": _optional_int(cbor_data.get("DatapointsToAlarm")),
             "Threshold": float(cbor_data.get("Threshold", 0)),
             "ComparisonOperator": cbor_data.get("ComparisonOperator"),
             "TreatMissingData": cbor_data.get("TreatMissingData", "missing"),
@@ -1038,7 +1038,7 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "ExtendedStatistic": _p(params, "ExtendedStatistic") or None,
             "Period": int(_p(params, "Period") or "60"),
             "EvaluationPeriods": int(_p(params, "EvaluationPeriods") or "1"),
-            "DatapointsToAlarm": _p(params, "DatapointsToAlarm"),
+            "DatapointsToAlarm": _optional_int(_p(params, "DatapointsToAlarm") or None),
             "Threshold": float(_p(params, "Threshold") or "0"),
             "ComparisonOperator": _p(params, "ComparisonOperator"),
             "TreatMissingData": _p(params, "TreatMissingData") or "missing",
@@ -1060,24 +1060,17 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "AlarmConfigurationUpdatedTimestamp": int(time.time()),
         }
 
-    # AWS returns DatapointsToAlarm only when the alarm sets it.
-    if alarm.get("DatapointsToAlarm"):
-        alarm["DatapointsToAlarm"] = int(alarm["DatapointsToAlarm"])
-    else:
-        alarm.pop("DatapointsToAlarm", None)
+    # DatapointsToAlarm is optional with no default in the PutMetricAlarm
+    # model; keep it off the record when the request leaves it unset.
+    if alarm["DatapointsToAlarm"] is None:
+        del alarm["DatapointsToAlarm"]
 
     is_new = name not in _alarms
     _alarms[name] = alarm
-    # Tags apply on creation only; AWS ignores them when updating an alarm.
+    # PutMetricAlarm applies Tags on creation only; on an existing alarm they
+    # are ignored (TagResource and UntagResource change them).
     if is_new:
-        if is_cbor or is_json:
-            create_tags = cbor_data.get("Tags") or []
-        else:
-            create_tags, ti = [], 1
-            while _p(params, f"Tags.member.{ti}.Key"):
-                create_tags.append({"Key": _p(params, f"Tags.member.{ti}.Key"),
-                                    "Value": _p(params, f"Tags.member.{ti}.Value")})
-                ti += 1
+        create_tags = _request_tags(params, cbor_data, is_cbor, is_json)
         if create_tags:
             _resource_tags[alarm["AlarmArn"]] = {t["Key"]: t.get("Value", "") for t in create_tags}
 
@@ -1267,7 +1260,8 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
         f"<Namespace>{a.get('Namespace','')}</Namespace><Threshold>{a.get('Threshold','')}</Threshold>"
         f"<ComparisonOperator>{a.get('ComparisonOperator','')}</ComparisonOperator>"
         f"<EvaluationPeriods>{a.get('EvaluationPeriods','')}</EvaluationPeriods>"
-        f"<StateReason>{a.get('StateReason','')}</StateReason>"
+        + (f"<DatapointsToAlarm>{a['DatapointsToAlarm']}</DatapointsToAlarm>" if "DatapointsToAlarm" in a else "")
+        + f"<StateReason>{a.get('StateReason','')}</StateReason>"
         f"</member>"
         for a in metric_alarms
     )
@@ -1524,22 +1518,26 @@ def _set_alarm_state(params, cbor_data, is_cbor, is_json=False):
 # ---------------------------------------------------------------------------
 
 
-def _tag_resource(params, cbor_data, is_cbor, is_json=False):
+def _request_tags(params, cbor_data, is_cbor, is_json=False):
+    """The Tags list of a request: CBOR/JSON ``Tags`` or Query ``Tags.member.N``."""
     if is_cbor or is_json:
-        arn = cbor_data.get("ResourceARN", "")
-        tags = cbor_data.get("Tags", [])
-    else:
-        arn = _p(params, "ResourceARN")
-        tags = []
-        i = 1
-        while _p(params, f"Tags.member.{i}.Key"):
-            tags.append(
-                {
-                    "Key": _p(params, f"Tags.member.{i}.Key"),
-                    "Value": _p(params, f"Tags.member.{i}.Value"),
-                }
-            )
-            i += 1
+        return cbor_data.get("Tags") or []
+    tags = []
+    i = 1
+    while _p(params, f"Tags.member.{i}.Key"):
+        tags.append(
+            {
+                "Key": _p(params, f"Tags.member.{i}.Key"),
+                "Value": _p(params, f"Tags.member.{i}.Value"),
+            }
+        )
+        i += 1
+    return tags
+
+
+def _tag_resource(params, cbor_data, is_cbor, is_json=False):
+    arn = cbor_data.get("ResourceARN", "") if is_cbor or is_json else _p(params, "ResourceARN")
+    tags = _request_tags(params, cbor_data, is_cbor, is_json)
 
     validation_error = _validate_alarm_tag_arn(arn, is_json=is_json, is_cbor=is_cbor)
     if validation_error:
@@ -1776,6 +1774,11 @@ def _dims_from_list(dimensions: list[dict]) -> dict:
 def _p(params, key, default=""):
     val = params.get(key, [default])
     return val[0] if isinstance(val, list) else val
+
+
+def _optional_int(value):
+    """``int(value)``, or ``None`` when the request leaves the member unset."""
+    return None if value is None else int(value)
 
 
 def _cbor_timestamp(value):

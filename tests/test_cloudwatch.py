@@ -1265,18 +1265,90 @@ def test_cloudwatch_parse_ts_accepts_cbor_datetime():
     assert _parse_ts(ts.replace(tzinfo=None)) == ts.timestamp()
 
 
+_ALARM_BASE = dict(MetricName="CPUUtilization", Namespace="AWS/EC2", Statistic="Average", Period=60,
+                   EvaluationPeriods=3, Threshold=80, ComparisonOperator="GreaterThanThreshold")
 
-def test_cloudwatch_put_metric_alarm_tags_and_optional_datapoints(cw):
-    """Tags passed to PutMetricAlarm apply on creation; DatapointsToAlarm is returned only when set."""
-    base = dict(MetricName="CPUUtilization", Namespace="AWS/EC2", Statistic="Average", Period=60,
-                EvaluationPeriods=3, Threshold=80, ComparisonOperator="GreaterThanThreshold")
-    cw.put_metric_alarm(AlarmName="tagged-alarm", Tags=[{"Key": "team", "Value": "platform"}], **base)
-    alarm = cw.describe_alarms(AlarmNames=["tagged-alarm"])["MetricAlarms"][0]
-    assert "DatapointsToAlarm" not in alarm
-    assert cw.list_tags_for_resource(ResourceARN=alarm["AlarmArn"])["Tags"] == [{"Key": "team", "Value": "platform"}]
-    # Updating an existing alarm ignores Tags, as on AWS.
-    cw.put_metric_alarm(AlarmName="tagged-alarm", Tags=[{"Key": "other", "Value": "x"}], DatapointsToAlarm=2, **base)
-    alarm = cw.describe_alarms(AlarmNames=["tagged-alarm"])["MetricAlarms"][0]
-    assert alarm["DatapointsToAlarm"] == 2
-    assert cw.list_tags_for_resource(ResourceARN=alarm["AlarmArn"])["Tags"] == [{"Key": "team", "Value": "platform"}]
-    cw.delete_alarms(AlarmNames=["tagged-alarm"])
+
+def test_cloudwatch_put_metric_alarm_applies_tags_on_create_only(cw):
+    """PutMetricAlarm's Tags are stored when it creates the alarm; on an
+    existing alarm they are ignored and TagResource changes them instead."""
+    name = f"tagged-alarm-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cw.put_metric_alarm(AlarmName=name, Tags=[{"Key": "team", "Value": "platform"}], **_ALARM_BASE)
+        arn = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["AlarmArn"]
+        assert cw.list_tags_for_resource(ResourceARN=arn)["Tags"] == [{"Key": "team", "Value": "platform"}]
+
+        cw.put_metric_alarm(AlarmName=name, Tags=[{"Key": "other", "Value": "x"}], **_ALARM_BASE)
+        assert cw.list_tags_for_resource(ResourceARN=arn)["Tags"] == [{"Key": "team", "Value": "platform"}]
+
+        cw.tag_resource(ResourceARN=arn, Tags=[{"Key": "other", "Value": "x"}])
+        assert sorted(t["Key"] for t in cw.list_tags_for_resource(ResourceARN=arn)["Tags"]) == ["other", "team"]
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_alarm_created_again_after_delete_has_only_its_own_tags(cw):
+    name = f"recreated-alarm-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cw.put_metric_alarm(AlarmName=name, Tags=[{"Key": "team", "Value": "platform"}], **_ALARM_BASE)
+        cw.delete_alarms(AlarmNames=[name])
+        cw.put_metric_alarm(AlarmName=name, Tags=[{"Key": "owner", "Value": ""}], **_ALARM_BASE)
+        arn = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["AlarmArn"]
+        assert cw.list_tags_for_resource(ResourceARN=arn)["Tags"] == [{"Key": "owner", "Value": ""}]
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_put_metric_alarm_returns_datapoints_to_alarm_only_when_set(cw):
+    """DatapointsToAlarm has no default in the PutMetricAlarm model, and an
+    update overwrites the whole configuration, so leaving it out clears it."""
+    name = f"m-of-n-alarm-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cw.put_metric_alarm(AlarmName=name, **_ALARM_BASE)
+        assert "DatapointsToAlarm" not in cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]
+
+        cw.put_metric_alarm(AlarmName=name, DatapointsToAlarm=2, **_ALARM_BASE)
+        assert cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["DatapointsToAlarm"] == 2
+
+        cw.put_metric_alarm(AlarmName=name, **_ALARM_BASE)
+        assert "DatapointsToAlarm" not in cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_put_metric_alarm_query_tags_and_datapoints_to_alarm():
+    """The Query protocol's Tags.member.N and DatapointsToAlarm members (boto3
+    sends CBOR, so this calls the handler with parsed form parameters)."""
+    import re as _re
+
+    from ministack.core import responses as _resp
+    from ministack.services import cloudwatch as _cw
+
+    acct_tok = _resp._request_account_id.set("000000000000")
+    region_tok = _resp._request_region.set("us-east-1")
+    name = f"query-alarm-{_uuid_mod.uuid4().hex[:8]}"
+    arn = f"arn:aws:cloudwatch:us-east-1:000000000000:alarm:{name}"
+    form = {
+        "AlarmName": [name], "MetricName": ["Errors"], "Namespace": ["AWS/Lambda"],
+        "Statistic": ["Sum"], "Period": ["60"], "EvaluationPeriods": ["3"], "Threshold": ["1"],
+        "ComparisonOperator": ["GreaterThanThreshold"],
+    }
+    try:
+        _cw._put_metric_alarm({**form, "Tags.member.1.Key": ["team"], "Tags.member.1.Value": ["platform"],
+                               "Tags.member.2.Key": ["owner"], "Tags.member.2.Value": [""]}, {}, is_cbor=False)
+        assert _cw._resource_tags[arn] == {"team": "platform", "owner": ""}
+        assert "DatapointsToAlarm" not in _cw._alarms[name]
+        _, _, body = _cw._describe_alarms({"AlarmNames.member.1": [name]}, {}, is_cbor=False)
+        assert "<DatapointsToAlarm>" not in body.decode()
+
+        _cw._put_metric_alarm({**form, "DatapointsToAlarm": ["2"],
+                               "Tags.member.1.Key": ["other"], "Tags.member.1.Value": ["x"]}, {}, is_cbor=False)
+        assert _cw._alarms[name]["DatapointsToAlarm"] == 2
+        assert _cw._resource_tags[arn] == {"team": "platform", "owner": ""}
+        _, _, body = _cw._describe_alarms({"AlarmNames.member.1": [name]}, {}, is_cbor=False)
+        assert _re.search(r"<DatapointsToAlarm>2</DatapointsToAlarm>", body.decode())
+    finally:
+        _cw._alarms.pop_scoped("000000000000", "us-east-1", name, None)
+        _cw._resource_tags.pop_scoped("000000000000", "us-east-1", arn, None)
+        _resp._request_region.reset(region_tok)
+        _resp._request_account_id.reset(acct_tok)
