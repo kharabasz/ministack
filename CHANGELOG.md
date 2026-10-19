@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **EC2 — Verified Access control plane** — instances, trust providers, groups and endpoints: create, describe, modify and delete, trust provider attach and detach, instance logging configuration, and group and endpoint policies, per account and region, as the `aws_verifiedaccess_*` Terraform resources call them. An instance takes one user trust provider and any number of device trust providers; deleting an attached trust provider, an instance with groups or a group with endpoints answers `InvalidParameterValue`; `rds` and `cidr` endpoints answer `UnsupportedOperation`; OIDC client secrets are never returned. No access evaluation. Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
