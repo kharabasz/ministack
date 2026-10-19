@@ -1574,6 +1574,20 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     if service == "ec2":
         # EC2 uses query params. Try resource ID fields in priority order.
+        # Verified Access ids. Describe* calls are not resource-scoped in EC2,
+        # so they keep resource "*". These come before the generic fields:
+        # CreateVerifiedAccessEndpoint also carries SecurityGroupId.1, and its
+        # resource is the group.
+        if not _query_param(query_params, "Action").startswith("DescribeVerifiedAccess"):
+            for field, rtype in (
+                ("VerifiedAccessEndpointId", "verified-access-endpoint"),
+                ("VerifiedAccessGroupId", "verified-access-group"),
+                ("VerifiedAccessInstanceId", "verified-access-instance"),
+                ("VerifiedAccessTrustProviderId", "verified-access-trust-provider"),
+            ):
+                val = _query_param(query_params, field)
+                if val:
+                    return f"arn:aws:ec2:{region}:{account_id}:{rtype}/{val}"
         _EC2_RESOURCE_FIELDS = [
             ("InstanceId.1", "instance"),
             ("InstanceId", "instance"),
