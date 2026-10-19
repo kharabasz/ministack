@@ -1264,3 +1264,19 @@ def test_cloudwatch_parse_ts_accepts_cbor_datetime():
     assert _parse_ts(ts) == ts.timestamp()
     assert _parse_ts(ts.replace(tzinfo=None)) == ts.timestamp()
 
+
+
+def test_cloudwatch_put_metric_alarm_tags_and_optional_datapoints(cw):
+    """Tags passed to PutMetricAlarm apply on creation; DatapointsToAlarm is returned only when set."""
+    base = dict(MetricName="CPUUtilization", Namespace="AWS/EC2", Statistic="Average", Period=60,
+                EvaluationPeriods=3, Threshold=80, ComparisonOperator="GreaterThanThreshold")
+    cw.put_metric_alarm(AlarmName="tagged-alarm", Tags=[{"Key": "team", "Value": "platform"}], **base)
+    alarm = cw.describe_alarms(AlarmNames=["tagged-alarm"])["MetricAlarms"][0]
+    assert "DatapointsToAlarm" not in alarm
+    assert cw.list_tags_for_resource(ResourceARN=alarm["AlarmArn"])["Tags"] == [{"Key": "team", "Value": "platform"}]
+    # Updating an existing alarm ignores Tags, as on AWS.
+    cw.put_metric_alarm(AlarmName="tagged-alarm", Tags=[{"Key": "other", "Value": "x"}], DatapointsToAlarm=2, **base)
+    alarm = cw.describe_alarms(AlarmNames=["tagged-alarm"])["MetricAlarms"][0]
+    assert alarm["DatapointsToAlarm"] == 2
+    assert cw.list_tags_for_resource(ResourceARN=alarm["AlarmArn"])["Tags"] == [{"Key": "team", "Value": "platform"}]
+    cw.delete_alarms(AlarmNames=["tagged-alarm"])

@@ -3066,3 +3066,15 @@ def test_cloudfront_get_distribution_xml_has_no_namespace_prefixes(cloudfront):
         raw = resp.read()
     assert b"ns0:" not in raw, "namespace prefixes leaked into the response XML"
     assert b"<Origins>" in raw and b"<DefaultCacheBehavior>" in raw
+
+
+def test_cloudfront_create_function_keeps_tags(cloudfront):
+    """CreateFunction's Tags are stored and listed on the function ARN; delete drops them."""
+    fn = cloudfront.create_function(
+        Name="tagged-fn", FunctionConfig={"Comment": "", "Runtime": "cloudfront-js-2.0"},
+        FunctionCode=b"function handler(event) { return event.request; }",
+        Tags={"Items": [{"Key": "environment", "Value": "dev"}]},
+    )
+    arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+    assert cloudfront.list_tags_for_resource(Resource=arn)["Tags"]["Items"] == [{"Key": "environment", "Value": "dev"}]
+    cloudfront.delete_function(Name="tagged-fn", IfMatch=fn["ETag"])
