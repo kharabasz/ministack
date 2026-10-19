@@ -409,6 +409,8 @@ def _create_state_machine(data):
         "loggingConfiguration": data.get(
             "loggingConfiguration",
             {"level": "OFF", "includeExecutionData": False}),
+        # Machines without a customer managed key report AWS_OWNED_KEY.
+        "encryptionConfiguration": data.get("encryptionConfiguration") or {"type": "AWS_OWNED_KEY"},
         # AWS rotates revisionId on every Create/Update. Callers use it
         # as an optimistic-concurrency precondition when publishing a
         # version (see _publish_state_machine_version).
@@ -444,6 +446,8 @@ def _create_state_machine(data):
             "type": _state_machines[arn]["type"],
             "loggingConfiguration": copy.deepcopy(
                 _state_machines[arn]["loggingConfiguration"]),
+            "encryptionConfiguration": copy.deepcopy(
+                _state_machines[arn]["encryptionConfiguration"]),
         }
         response["stateMachineVersionArn"] = version_arn
     return json_response(response)
@@ -473,8 +477,10 @@ def _describe_state_machine(data):
     arn = data.get("stateMachineArn")
     sm = _state_machines.get(arn)
     if sm:
-        return json_response({k: v for k, v in sm.items()
-                              if k not in _SM_INTERNAL_KEYS})
+        body = {k: v for k, v in sm.items() if k not in _SM_INTERNAL_KEYS}
+        # Machines persisted before encryptionConfiguration was stored.
+        body.setdefault("encryptionConfiguration", {"type": "AWS_OWNED_KEY"})
+        return json_response(body)
     # AWS's DescribeStateMachine also accepts a qualified version ARN
     # (arn:...:stateMachine:<name>:<N>) and returns the snapshot
     # captured at publish time, with stateMachineArn echoing the
@@ -493,6 +499,8 @@ def _describe_state_machine(data):
             "description": version.get("description", ""),
             "loggingConfiguration": version.get("loggingConfiguration")
                 or base_sm.get("loggingConfiguration", {"level": "OFF"}),
+            "encryptionConfiguration": version.get("encryptionConfiguration")
+                or base_sm.get("encryptionConfiguration", {"type": "AWS_OWNED_KEY"}),
             "revisionId": version.get("stateMachineRevisionId", ""),
         })
     # DescribeStateMachine on an alias ARN: AWS accepts it and returns
@@ -513,6 +521,7 @@ def _describe_state_machine(data):
             "status": "ACTIVE",
             "description": alias.get("description", ""),
             "loggingConfiguration": base_sm.get("loggingConfiguration", {"level": "OFF"}),
+            "encryptionConfiguration": base_sm.get("encryptionConfiguration", {"type": "AWS_OWNED_KEY"}),
             "revisionId": base_sm.get("revisionId", ""),
         })
     return error_response_json(
@@ -536,6 +545,8 @@ def _update_state_machine(data):
         sm["roleArn"] = data["roleArn"]
     if "loggingConfiguration" in data:
         sm["loggingConfiguration"] = data["loggingConfiguration"]
+    if "encryptionConfiguration" in data:
+        sm["encryptionConfiguration"] = data["encryptionConfiguration"] or {"type": "AWS_OWNED_KEY"}
     # Rotate revisionId so subsequent PublishStateMachineVersion calls
     # with a stale caller-supplied revisionId raise ConflictException
     # (matches AWS optimistic-concurrency semantics).
@@ -559,6 +570,8 @@ def _update_state_machine(data):
             "roleArn": sm["roleArn"],
             "type": sm["type"],
             "loggingConfiguration": copy.deepcopy(sm["loggingConfiguration"]),
+            "encryptionConfiguration": copy.deepcopy(
+                sm.get("encryptionConfiguration", {"type": "AWS_OWNED_KEY"})),
         }
         response["stateMachineVersionArn"] = version_arn
         response["revisionId"] = sm["revisionId"]
@@ -5169,6 +5182,8 @@ def _publish_state_machine_version(data):
         "type": sm.get("type", "STANDARD"),
         "loggingConfiguration": copy.deepcopy(
             sm.get("loggingConfiguration", {"level": "OFF"})),
+        "encryptionConfiguration": copy.deepcopy(
+            sm.get("encryptionConfiguration", {"type": "AWS_OWNED_KEY"})),
     }
     return json_response({
         "stateMachineVersionArn": version_arn,

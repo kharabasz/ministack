@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Step Functions — encryption configuration** — `CreateStateMachine` and `UpdateStateMachine` dropped `encryptionConfiguration`; it is stored (default `AWS_OWNED_KEY`), returned by `DescribeStateMachine` for machines, versions and aliases, and snapshotted into published versions.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
