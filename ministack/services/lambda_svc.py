@@ -259,11 +259,30 @@ LAMBDA_DOCKER_FLAGS = os.environ.get("LAMBDA_DOCKER_FLAGS", "")
 # instead of silently degrading to an in-process execution that diverges from
 # real AWS semantics.
 LAMBDA_STRICT = os.environ.get("LAMBDA_STRICT", "0").lower() in ("1", "true", "yes")
-# Accounts whose layers are public on AWS (vendor extensions such as Datadog's
-# 464622532012). MiniStack cannot know which real layers are public, so layers
-# from these accounts that MiniStack does not hold resolve without content.
-LAMBDA_PUBLIC_LAYER_ACCOUNTS = frozenset(
-    a.strip() for a in os.environ.get("LAMBDA_PUBLIC_LAYER_ACCOUNTS", "").split(",") if a.strip()
+
+
+def _parse_public_layer_accounts(raw: str) -> frozenset:
+    """Comma-separated 12-digit account ids; anything else is logged and dropped."""
+    accounts = set()
+    for entry in (part.strip() for part in raw.split(",")):
+        if not entry:
+            continue
+        if _12_DIGIT_RE.match(entry):
+            accounts.add(entry)
+        else:
+            logger.warning(
+                "LAMBDA_PUBLIC_LAYER_ACCOUNTS: ignoring %r, not a 12-digit account id", entry
+            )
+    return frozenset(accounts)
+
+
+# Accounts whose layers are public on AWS (third-party extensions such as
+# Datadog's 464622532012). MiniStack holds no state for these accounts, so it
+# cannot see the public grant the publisher put on each layer version; layers
+# from these accounts that MiniStack does not hold resolve without content,
+# the same way the AWS-published extensions below do. Read once at startup.
+LAMBDA_PUBLIC_LAYER_ACCOUNTS = _parse_public_layer_accounts(
+    os.environ.get("LAMBDA_PUBLIC_LAYER_ACCOUNTS", "")
 )
 
 # Lambda proxy mode: invocations are forwarded to a user-managed HTTP
@@ -1756,30 +1775,27 @@ def _is_aws_published_layer(layer_name: str) -> bool:
 
 
 def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version):
-    """Another account's layer through its grant; an unknown account passes by
-    name, and the bytes are not available offline (CodeSize 0, does not run)."""
+    """Another account's layer through its grant. A layer MiniStack does not
+    hold still resolves when its name is an AWS-published extension or its
+    account is in LAMBDA_PUBLIC_LAYER_ACCOUNTS; the bytes are not available
+    offline, so it has CodeSize 0 and does not run. Anything else is denied."""
     if spec.region != get_region():
         return _layer_access_denied(layer_arn)
     layer_name, version = name_and_version
     vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
     if vc is not None and _layer_policy_allows(vc, get_account_id()):
         return vc, None
-    if vc is None and spec.account_id in LAMBDA_PUBLIC_LAYER_ACCOUNTS:
+    if vc is None:
+        if _is_aws_published_layer(layer_name):
+            source = "an AWS-published extension"
+        elif spec.account_id in LAMBDA_PUBLIC_LAYER_ACCOUNTS:
+            source = "from an account in LAMBDA_PUBLIC_LAYER_ACCOUNTS"
+        else:
+            return _layer_access_denied(layer_arn)
         logger.warning(
-            "Layer %s is from LAMBDA_PUBLIC_LAYER_ACCOUNTS: the reference resolves "
-            "so the stack deploys, but the bytes are not available offline and the "
-            "layer will not run", layer_arn,
-        )
-        return {
-            "LayerVersionArn": layer_arn,
-            "Version": version,
-            "Content": {"CodeSize": 0},
-        }, None
-    if vc is None and _is_aws_published_layer(layer_name):
-        logger.warning(
-            "Layer %s is an AWS-published extension: the reference resolves so "
-            "the stack deploys, but the bytes are not available offline and the "
-            "extension will not run", layer_arn,
+            "Layer %s is %s: the reference resolves so the stack deploys, but "
+            "the bytes are not available offline and the layer will not run",
+            layer_arn, source,
         )
         return {
             "LayerVersionArn": layer_arn,
