@@ -354,10 +354,75 @@ def _validate_definition_jsonata(definition_str) -> str | None:
     return walk(definition, "")
 
 
+_ENCRYPTION_TYPES = ("AWS_OWNED_KEY", "CUSTOMER_MANAGED_KMS_KEY")
+
+
+def _default_encryption():
+    """The encryptionConfiguration a machine reports when no customer
+    managed key was set. A fresh dict each call, so no two records share one."""
+    return {"type": "AWS_OWNED_KEY"}
+
+
+def _validate_encryption_configuration(cfg):
+    """The error response for an encryptionConfiguration CreateStateMachine
+    or UpdateStateMachine must refuse, or None when it is acceptable.
+
+    Shape errors (missing or unknown type, kmsKeyId outside 1..2048
+    characters, a non-integer reuse period) are ValidationException; the
+    conditions the botocore model documents for InvalidEncryptionConfiguration
+    (CUSTOMER_MANAGED_KMS_KEY without kmsKeyId, kmsDataKeyReusePeriodSeconds
+    outside 60..900) answer with that code. The key itself is not looked up
+    in KMS.
+    """
+    if not isinstance(cfg, dict):
+        return error_response_json(
+            "ValidationException",
+            "encryptionConfiguration must be a structure", 400)
+    enc_type = cfg.get("type")
+    if enc_type not in _ENCRYPTION_TYPES:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{enc_type}' at "
+            "'encryptionConfiguration.type' failed to satisfy constraint: "
+            f"Member must satisfy enum value set: [{', '.join(_ENCRYPTION_TYPES)}]",
+            400)
+    key_id = cfg.get("kmsKeyId")
+    if key_id is not None and (not isinstance(key_id, str) or not 1 <= len(key_id) <= 2048):
+        return error_response_json(
+            "ValidationException",
+            "1 validation error detected: Value at 'encryptionConfiguration.kmsKeyId' "
+            "failed to satisfy constraint: Member must have length between 1 and 2048",
+            400)
+    if enc_type == "CUSTOMER_MANAGED_KMS_KEY" and not key_id:
+        return error_response_json(
+            "InvalidEncryptionConfiguration",
+            "kmsKeyId is required when type is CUSTOMER_MANAGED_KMS_KEY", 400)
+    period = cfg.get("kmsDataKeyReusePeriodSeconds")
+    if period is not None:
+        if isinstance(period, bool) or not isinstance(period, int):
+            return error_response_json(
+                "ValidationException",
+                "encryptionConfiguration.kmsDataKeyReusePeriodSeconds must be an integer",
+                400)
+        if not 60 <= period <= 900:
+            return error_response_json(
+                "InvalidEncryptionConfiguration",
+                "kmsDataKeyReusePeriodSeconds must be between 60 and 900 seconds", 400)
+    return None
+
+
 def _create_state_machine(data):
     name = data.get("name")
     if not name:
         return error_response_json("ValidationException", "name is required", 400)
+    encryption = data.get("encryptionConfiguration")
+    if encryption is None:
+        encryption = _default_encryption()
+    else:
+        invalid = _validate_encryption_configuration(encryption)
+        if invalid:
+            return invalid
+        encryption = copy.deepcopy(encryption)
     invalid = _validate_definition_jsonata(data.get("definition"))
     if invalid:
         return error_response_json("InvalidDefinition", invalid, 400)
@@ -365,7 +430,7 @@ def _create_state_machine(data):
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:stateMachine:{name}"
     if arn in _state_machines:
         # Creating the same machine twice is idempotent on AWS and makes SDK retry safe
-        # It checks the sfn itself: definition, type, logging and whether the call publishes
+        # It checks the sfn itself: definition, type, logging, encryption and whether the call publishes
         existing = _state_machines[arn]
         publishes = bool(data.get("publish"))
         if (data.get("definition", "{}") == existing["definition"]
@@ -373,6 +438,7 @@ def _create_state_machine(data):
                 and data.get("loggingConfiguration",
                              {"level": "OFF", "includeExecutionData": False})
                 == existing["loggingConfiguration"]
+                and encryption == existing.get("encryptionConfiguration", _default_encryption())
                 and publishes == bool(existing.get("createVersionArn"))
                 # AWS's idempotency check also covers versionDescription: a
                 # publishing re-create carrying a different description is a
@@ -410,7 +476,7 @@ def _create_state_machine(data):
             "loggingConfiguration",
             {"level": "OFF", "includeExecutionData": False}),
         # Machines without a customer managed key report AWS_OWNED_KEY.
-        "encryptionConfiguration": data.get("encryptionConfiguration") or {"type": "AWS_OWNED_KEY"},
+        "encryptionConfiguration": encryption,
         # AWS rotates revisionId on every Create/Update. Callers use it
         # as an optimistic-concurrency precondition when publishing a
         # version (see _publish_state_machine_version).
@@ -479,7 +545,7 @@ def _describe_state_machine(data):
     if sm:
         body = {k: v for k, v in sm.items() if k not in _SM_INTERNAL_KEYS}
         # Machines persisted before encryptionConfiguration was stored.
-        body.setdefault("encryptionConfiguration", {"type": "AWS_OWNED_KEY"})
+        body.setdefault("encryptionConfiguration", _default_encryption())
         return json_response(body)
     # AWS's DescribeStateMachine also accepts a qualified version ARN
     # (arn:...:stateMachine:<name>:<N>) and returns the snapshot
@@ -500,7 +566,7 @@ def _describe_state_machine(data):
             "loggingConfiguration": version.get("loggingConfiguration")
                 or base_sm.get("loggingConfiguration", {"level": "OFF"}),
             "encryptionConfiguration": version.get("encryptionConfiguration")
-                or base_sm.get("encryptionConfiguration", {"type": "AWS_OWNED_KEY"}),
+                or base_sm.get("encryptionConfiguration") or _default_encryption(),
             "revisionId": version.get("stateMachineRevisionId", ""),
         })
     # DescribeStateMachine on an alias ARN: AWS accepts it and returns
@@ -521,7 +587,7 @@ def _describe_state_machine(data):
             "status": "ACTIVE",
             "description": alias.get("description", ""),
             "loggingConfiguration": base_sm.get("loggingConfiguration", {"level": "OFF"}),
-            "encryptionConfiguration": base_sm.get("encryptionConfiguration", {"type": "AWS_OWNED_KEY"}),
+            "encryptionConfiguration": base_sm.get("encryptionConfiguration") or _default_encryption(),
             "revisionId": base_sm.get("revisionId", ""),
         })
     return error_response_json(
@@ -536,6 +602,12 @@ def _update_state_machine(data):
         return error_response_json(
             "StateMachineDoesNotExist",
             f"State machine {arn} not found", 400)
+    # Validated before anything is written, so a refused call changes nothing.
+    encryption = data.get("encryptionConfiguration")
+    if encryption is not None:
+        invalid = _validate_encryption_configuration(encryption)
+        if invalid:
+            return invalid
     if "definition" in data:
         invalid = _validate_definition_jsonata(data["definition"])
         if invalid:
@@ -545,8 +617,8 @@ def _update_state_machine(data):
         sm["roleArn"] = data["roleArn"]
     if "loggingConfiguration" in data:
         sm["loggingConfiguration"] = data["loggingConfiguration"]
-    if "encryptionConfiguration" in data:
-        sm["encryptionConfiguration"] = data["encryptionConfiguration"] or {"type": "AWS_OWNED_KEY"}
+    if encryption is not None:
+        sm["encryptionConfiguration"] = copy.deepcopy(encryption)
     # Rotate revisionId so subsequent PublishStateMachineVersion calls
     # with a stale caller-supplied revisionId raise ConflictException
     # (matches AWS optimistic-concurrency semantics).
@@ -571,7 +643,7 @@ def _update_state_machine(data):
             "type": sm["type"],
             "loggingConfiguration": copy.deepcopy(sm["loggingConfiguration"]),
             "encryptionConfiguration": copy.deepcopy(
-                sm.get("encryptionConfiguration", {"type": "AWS_OWNED_KEY"})),
+                sm.get("encryptionConfiguration") or _default_encryption()),
         }
         response["stateMachineVersionArn"] = version_arn
         response["revisionId"] = sm["revisionId"]
@@ -981,6 +1053,8 @@ def _describe_state_machine_for_execution(data):
         "definition": sm["definition"],
         "roleArn": sm["roleArn"],
         "updateDate": sm.get("creationDate", now_iso()),
+        "encryptionConfiguration": copy.deepcopy(
+            sm.get("encryptionConfiguration") or _default_encryption()),
     })
 
 
@@ -5183,7 +5257,7 @@ def _publish_state_machine_version(data):
         "loggingConfiguration": copy.deepcopy(
             sm.get("loggingConfiguration", {"level": "OFF"})),
         "encryptionConfiguration": copy.deepcopy(
-            sm.get("encryptionConfiguration", {"type": "AWS_OWNED_KEY"})),
+            sm.get("encryptionConfiguration") or _default_encryption()),
     }
     return json_response({
         "stateMachineVersionArn": version_arn,

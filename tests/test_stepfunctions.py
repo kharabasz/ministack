@@ -12,7 +12,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import ENDPOINT, LoopProbe, concurrent_burst, sqs_policy_allow_sns
+from conftest import ENDPOINT, LoopProbe, concurrent_burst, make_client, sqs_policy_allow_sns
 
 
 def _make_zip(code: str) -> bytes:
@@ -9278,22 +9278,211 @@ def test_sdk_lambda_get_function_missing_function_exact_catch(sfn):
     assert json.loads(result["output"])["caught"]["Error"] == "Lambda.ResourceNotFoundException"
 
 
-def test_sfn_encryption_configuration_round_trips(sfn):
-    """encryptionConfiguration is stored, defaults to AWS_OWNED_KEY and survives updates."""
-    import json as _json
-    import uuid as _uuid
-    definition = _json.dumps({"StartAt": "Done", "States": {"Done": {"Type": "Succeed"}}})
-    role = "arn:aws:iam::000000000000:role/sfn-role"
-    plain = sfn.create_state_machine(name=f"enc-default-{_uuid.uuid4().hex[:6]}", definition=definition, roleArn=role)
-    assert sfn.describe_state_machine(stateMachineArn=plain["stateMachineArn"])["encryptionConfiguration"] == {
-        "type": "AWS_OWNED_KEY"}
-    key = "arn:aws:kms:us-east-1:000000000000:key/sfn-key"
-    cfg = {"type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key, "kmsDataKeyReusePeriodSeconds": 300}
+
+_ENC_DEFINITION = json.dumps({"StartAt": "Done", "States": {"Done": {"Type": "Succeed"}}})
+_ENC_ROLE = "arn:aws:iam::000000000000:role/sfn-role"
+_ENC_DEFAULT = {"type": "AWS_OWNED_KEY"}
+
+
+def _enc_cmk(period=300):
+    return {"type": "CUSTOMER_MANAGED_KMS_KEY",
+            "kmsKeyId": "arn:aws:kms:us-east-1:000000000000:key/sfn-key",
+            "kmsDataKeyReusePeriodSeconds": period}
+
+
+@contextmanager
+def _enc_machine(sfn, prefix, **kwargs):
     arn = sfn.create_state_machine(
-        name=f"enc-cmk-{_uuid.uuid4().hex[:6]}", definition=definition, roleArn=role,
-        encryptionConfiguration=cfg)["stateMachineArn"]
-    assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == cfg
-    sfn.update_state_machine(stateMachineArn=arn, encryptionConfiguration={"type": "AWS_OWNED_KEY"})
-    assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == {"type": "AWS_OWNED_KEY"}
-    sfn.delete_state_machine(stateMachineArn=arn)
-    sfn.delete_state_machine(stateMachineArn=plain["stateMachineArn"])
+        name=f"{prefix}-{_uuid_mod.uuid4().hex[:8]}", definition=_ENC_DEFINITION,
+        roleArn=_ENC_ROLE, **kwargs)["stateMachineArn"]
+    try:
+        yield arn
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+
+def test_sfn_encryption_configuration_defaults_to_aws_owned_key(sfn):
+    with _enc_machine(sfn, "enc-default") as arn:
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _ENC_DEFAULT
+
+
+def test_sfn_encryption_configuration_customer_managed_key_is_returned(sfn):
+    with _enc_machine(sfn, "enc-cmk", encryptionConfiguration=_enc_cmk()) as arn:
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _enc_cmk()
+
+
+def test_sfn_encryption_configuration_update_replaces_it(sfn):
+    with _enc_machine(sfn, "enc-upd", encryptionConfiguration=_enc_cmk()) as arn:
+        sfn.update_state_machine(stateMachineArn=arn, definition=_ENC_DEFINITION,
+                                 encryptionConfiguration=_ENC_DEFAULT)
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _ENC_DEFAULT
+        # An update that does not mention it leaves it alone.
+        sfn.update_state_machine(stateMachineArn=arn, encryptionConfiguration=_enc_cmk(600),
+                                 definition=_ENC_DEFINITION)
+        sfn.update_state_machine(stateMachineArn=arn, roleArn=_ENC_ROLE)
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _enc_cmk(600)
+
+
+def test_sfn_encryption_configuration_versions_keep_their_snapshot(sfn):
+    """Each published version keeps the configuration it was published with;
+    an alias describes the base machine's current configuration."""
+    with _enc_machine(sfn, "enc-ver", encryptionConfiguration=_enc_cmk(), publish=True) as arn:
+        v1 = f"{arn}:1"
+        updated = sfn.update_state_machine(
+            stateMachineArn=arn, definition=_ENC_DEFINITION,
+            encryptionConfiguration=_ENC_DEFAULT, publish=True)
+        v2 = updated["stateMachineVersionArn"]
+        sfn.update_state_machine(stateMachineArn=arn, definition=_ENC_DEFINITION,
+                                 encryptionConfiguration=_enc_cmk(120))
+        v3 = sfn.publish_state_machine_version(stateMachineArn=arn)["stateMachineVersionArn"]
+        alias_arn = sfn.create_state_machine_alias(
+            name="live", routingConfiguration=[{"stateMachineVersionArn": v1, "weight": 100}],
+        )["stateMachineAliasArn"]
+        try:
+            assert sfn.describe_state_machine(stateMachineArn=v1)["encryptionConfiguration"] == _enc_cmk()
+            assert sfn.describe_state_machine(stateMachineArn=v2)["encryptionConfiguration"] == _ENC_DEFAULT
+            assert sfn.describe_state_machine(stateMachineArn=v3)["encryptionConfiguration"] == _enc_cmk(120)
+            assert (sfn.describe_state_machine(stateMachineArn=alias_arn)["encryptionConfiguration"]
+                    == _enc_cmk(120))
+        finally:
+            sfn.delete_state_machine_alias(stateMachineAliasArn=alias_arn)
+            for version in (v1, v2, v3):
+                sfn.delete_state_machine_version(stateMachineVersionArn=version)
+
+
+def test_sfn_encryption_configuration_on_describe_for_execution(sfn):
+    with _enc_machine(sfn, "enc-exec", encryptionConfiguration=_enc_cmk()) as arn:
+        execution = sfn.start_execution(stateMachineArn=arn, input="{}")["executionArn"]
+        described = sfn.describe_state_machine_for_execution(executionArn=execution)
+        assert described["encryptionConfiguration"] == _enc_cmk()
+
+
+def test_sfn_encryption_configuration_is_part_of_create_idempotency(sfn):
+    """Re-creating with the same configuration is a retry; a different one is
+    StateMachineAlreadyExists and leaves the stored configuration alone."""
+    name = f"enc-idem-{_uuid_mod.uuid4().hex[:8]}"
+    arn = sfn.create_state_machine(name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+                                   encryptionConfiguration=_enc_cmk())["stateMachineArn"]
+    try:
+        again = sfn.create_state_machine(name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+                                         encryptionConfiguration=_enc_cmk())
+        assert again["stateMachineArn"] == arn
+        for different in ({"encryptionConfiguration": _ENC_DEFAULT},
+                          {"encryptionConfiguration": _enc_cmk(900)},
+                          {}):
+            with pytest.raises(ClientError) as exc:
+                sfn.create_state_machine(name=name, definition=_ENC_DEFINITION,
+                                         roleArn=_ENC_ROLE, **different)
+            assert exc.value.response["Error"]["Code"] == "StateMachineAlreadyExists"
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _enc_cmk()
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+
+def test_sfn_encryption_configuration_default_is_idempotent(sfn):
+    name = f"enc-idem-def-{_uuid_mod.uuid4().hex[:8]}"
+    arn = sfn.create_state_machine(name=name, definition=_ENC_DEFINITION,
+                                   roleArn=_ENC_ROLE)["stateMachineArn"]
+    try:
+        again = sfn.create_state_machine(name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+                                         encryptionConfiguration=_ENC_DEFAULT)
+        assert again["stateMachineArn"] == arn
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+
+def _sfn_unvalidated():
+    """A client without boto3's client-side parameter validation, so
+    out-of-range values reach the server."""
+    return make_client("stepfunctions", {"parameter_validation": False})
+
+
+_INVALID_ENCRYPTION = [
+    ({"type": "CUSTOMER_MANAGED_KMS_KEY"}, "InvalidEncryptionConfiguration"),
+    ({"type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": "alias/k",
+      "kmsDataKeyReusePeriodSeconds": 59}, "InvalidEncryptionConfiguration"),
+    ({"type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": "alias/k",
+      "kmsDataKeyReusePeriodSeconds": 901}, "InvalidEncryptionConfiguration"),
+    ({"type": "SOME_OTHER_KEY"}, "ValidationException"),
+    ({}, "ValidationException"),
+    ({"type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": ""}, "ValidationException"),
+    ({"type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": "k" * 2049}, "ValidationException"),
+]
+
+
+@pytest.mark.parametrize("encryption,code", _INVALID_ENCRYPTION)
+def test_sfn_create_rejects_invalid_encryption_configuration(sfn, encryption, code):
+    name = f"enc-bad-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        _sfn_unvalidated().create_state_machine(
+            name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+            encryptionConfiguration=encryption)
+    assert exc.value.response["Error"]["Code"] == code
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    names = [m["name"] for m in sfn.list_state_machines()["stateMachines"]]
+    assert name not in names
+
+
+@pytest.mark.parametrize("encryption,code", _INVALID_ENCRYPTION)
+def test_sfn_update_rejects_invalid_encryption_configuration(sfn, encryption, code):
+    """A refused update changes nothing, the definition included."""
+    with _enc_machine(sfn, "enc-bad-upd", encryptionConfiguration=_enc_cmk()) as arn:
+        new_definition = json.dumps({"StartAt": "P", "States": {"P": {"Type": "Pass", "End": True}}})
+        with pytest.raises(ClientError) as exc:
+            _sfn_unvalidated().update_state_machine(
+                stateMachineArn=arn, definition=new_definition,
+                encryptionConfiguration=encryption)
+        assert exc.value.response["Error"]["Code"] == code
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        described = sfn.describe_state_machine(stateMachineArn=arn)
+        assert described["encryptionConfiguration"] == _enc_cmk()
+        assert described["definition"] == _ENC_DEFINITION
+
+
+def test_sfn_encryption_configuration_persists_and_defaults_for_older_records():
+    """get_state/restore keeps the configuration; a record saved before the
+    field existed describes as AWS_OWNED_KEY, and so do its versions."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import stepfunctions as m
+
+    original_account, original_region = get_account_id(), get_region()
+    saved = m.get_state()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        m.reset()
+        status, _, body = m._create_state_machine({
+            "name": "enc-persist", "definition": _ENC_DEFINITION, "roleArn": _ENC_ROLE,
+            "encryptionConfiguration": _enc_cmk()})
+        assert status == 200
+        cmk_arn = json.loads(body)["stateMachineArn"]
+        status, _, body = m._create_state_machine({
+            "name": "enc-legacy", "definition": _ENC_DEFINITION, "roleArn": _ENC_ROLE,
+            "publish": True})
+        assert status == 200
+        legacy_arn = json.loads(body)["stateMachineArn"]
+
+        state = m.get_state()
+        scope = ("000000000000", "us-east-1")
+        del state["state_machines"].get_scoped(*scope, legacy_arn)["encryptionConfiguration"]
+        del state["state_machine_versions"].get_scoped(
+            *scope, f"{legacy_arn}:1")["encryptionConfiguration"]
+        m.reset()
+        m.load_persisted_state(state)
+
+        def described(arn):
+            return json.loads(m._describe_state_machine({"stateMachineArn": arn})[2])
+
+        assert described(cmk_arn)["encryptionConfiguration"] == _enc_cmk()
+        assert described(legacy_arn)["encryptionConfiguration"] == _ENC_DEFAULT
+        assert described(f"{legacy_arn}:1")["encryptionConfiguration"] == _ENC_DEFAULT
+    finally:
+        m.reset()
+        m.load_persisted_state(saved)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
