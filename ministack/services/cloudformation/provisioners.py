@@ -24,6 +24,7 @@ import ministack.services.alb as _alb
 import ministack.services.apigateway as _apigw_v2
 import ministack.services.apigateway_v1 as _apigw_v1
 import ministack.services.appconfig as _appconfig
+import ministack.services.application_autoscaling as _aas
 import ministack.services.appsync as _appsync
 import ministack.services.autoscaling as _asg
 import ministack.services.backup as _backup
@@ -9830,6 +9831,219 @@ def _sd_instance_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# Application Auto Scaling (AWS::ApplicationAutoScaling::*)
+#
+# Both types go through the application_autoscaling module's own operations,
+# so a stack-created target or policy is the record the API writes. Ref and
+# the replacement properties follow the CloudFormation Template Reference
+# pages for the two types: a ScalableTarget's Ref is
+# "<ResourceId>|<ScalableDimension>|<ServiceNamespace>", a ScalingPolicy's Ref
+# is its ARN. The identity properties of both types require replacement and
+# are listed in _REPLACING_PROPERTIES, so the update handlers only change a
+# resource in place.
+# ---------------------------------------------------------------------------
+
+_AAS_IDENTITY = ("ServiceNamespace", "ResourceId", "ScalableDimension")
+
+
+def _aas_result(response, what, missing_ok=False):
+    """The parsed body of an application_autoscaling call, or ValueError naming
+    ``what``. With ``missing_ok`` an ObjectNotFoundException returns None."""
+    status, _, body = response
+    parsed = json.loads(body) if body else {}
+    if status >= 400:
+        if missing_ok and parsed.get("__type") == "ObjectNotFoundException":
+            return None
+        raise ValueError(f"{what} failed: {parsed.get('Message', body)}")
+    return parsed
+
+
+def _aas_int(value):
+    """A template integer, which a parameter can carry as a string."""
+    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+        return int(value)
+    return value
+
+
+def _aas_number(value):
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _aas_target_id(identity):
+    return f"{identity['ResourceId']}|{identity['ScalableDimension']}|{identity['ServiceNamespace']}"
+
+
+def _aas_target_identity(props):
+    return {name: props.get(name) for name in _AAS_IDENTITY}
+
+
+def _aas_suspended_state(props):
+    state = props.get("SuspendedState") or {}
+    return {name: _cfn_bool(state.get(name, False))
+            for name in ("DynamicScalingInSuspended", "DynamicScalingOutSuspended",
+                         "ScheduledScalingSuspended")}
+
+
+def _aas_scheduled_actions(props):
+    return {a["ScheduledActionName"]: a for a in props.get("ScheduledActions") or []
+            if isinstance(a, dict) and a.get("ScheduledActionName")}
+
+
+def _aas_put_scheduled_action(identity, action):
+    payload = dict(identity, ScheduledActionName=action["ScheduledActionName"])
+    for name in ("Schedule", "Timezone", "StartTime", "EndTime"):
+        if name in action:
+            payload[name] = action[name]
+    if isinstance(action.get("ScalableTargetAction"), dict):
+        payload["ScalableTargetAction"] = {k: _aas_int(v) for k, v in action["ScalableTargetAction"].items()}
+    _aas_result(_aas.call("PutScheduledAction", payload),
+                "AWS::ApplicationAutoScaling::ScalableTarget ScheduledActions")
+
+
+def _aas_register(identity, props, what, tags=None):
+    payload = dict(identity)
+    for name in ("MinCapacity", "MaxCapacity"):
+        payload[name] = _aas_int(props.get(name))
+    if props.get("RoleARN"):
+        payload["RoleARN"] = props["RoleARN"]
+    payload["SuspendedState"] = _aas_suspended_state(props)
+    if tags:
+        payload["Tags"] = tags
+    return _aas_result(_aas.call("RegisterScalableTarget", payload), what)
+
+
+def _aas_target_create(logical_id, props, stack_name):
+    """Register the target. A target registered outside the stack is refused,
+    so a template cannot take it over (inference: RegisterScalableTarget
+    upserts, and AWS documents no CloudFormation behaviour for an existing
+    target)."""
+    identity = _aas_target_identity(props)
+    physical_id = _aas_target_id(identity)
+    if all(identity.values()) and _aas._targets.get(_aas._target_key(identity)) is not None:
+        raise ValueError(f"AWS::ApplicationAutoScaling::ScalableTarget {physical_id} already exists")
+    _aas_register(identity, props, "AWS::ApplicationAutoScaling::ScalableTarget create",
+                  tags=_tag_map(props.get("Tags")))
+    for action in _aas_scheduled_actions(props).values():
+        _aas_put_scheduled_action(identity, action)
+    return physical_id, {"Id": physical_id}
+
+
+def _aas_target_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """MinCapacity, MaxCapacity, RoleARN, SuspendedState, ScheduledActions and
+    Tags change in place."""
+    identity = _aas_target_identity(new_props)
+    result = _aas_register(identity, new_props, "AWS::ApplicationAutoScaling::ScalableTarget update")
+    arn = result["ScalableTargetARN"]
+    old_tags, new_tags = _tag_map(old_props.get("Tags")), _tag_map(new_props.get("Tags"))
+    dropped = sorted(old_tags.keys() - new_tags.keys())
+    if dropped:
+        _aas_result(_aas.call("UntagResource", {"ResourceARN": arn, "TagKeys": dropped}),
+                    "AWS::ApplicationAutoScaling::ScalableTarget Tags")
+    if new_tags and new_tags != old_tags:
+        _aas_result(_aas.call("TagResource", {"ResourceARN": arn, "Tags": new_tags}),
+                    "AWS::ApplicationAutoScaling::ScalableTarget Tags")
+    old_actions, new_actions = _aas_scheduled_actions(old_props), _aas_scheduled_actions(new_props)
+    for name in sorted(old_actions.keys() - new_actions.keys()):
+        _aas_result(_aas.call("DeleteScheduledAction", dict(identity, ScheduledActionName=name)),
+                    "AWS::ApplicationAutoScaling::ScalableTarget ScheduledActions", missing_ok=True)
+    for name, action in new_actions.items():
+        if action != old_actions.get(name):
+            _aas_put_scheduled_action(identity, action)
+    return physical_id, {"Id": physical_id}
+
+
+def _aas_target_delete(physical_id, props):
+    """Deregistering also removes the target's policies and scheduled actions."""
+    _aas_result(_aas.call("DeregisterScalableTarget", _aas_target_identity(props)),
+                "AWS::ApplicationAutoScaling::ScalableTarget delete", missing_ok=True)
+
+
+def _aas_policy_identity(props):
+    """The target a policy belongs to: ScalingTargetId, or the three identity
+    properties, but not both (Template Reference)."""
+    target_id = props.get("ScalingTargetId")
+    explicit = [props.get(name) for name in _AAS_IDENTITY]
+    if target_id and any(explicit):
+        raise ValueError("AWS::ApplicationAutoScaling::ScalingPolicy takes either ScalingTargetId or "
+                         "ResourceId, ScalableDimension and ServiceNamespace, not both")
+    if target_id:
+        parts = str(target_id).rsplit("|", 2)
+        if len(parts) != 3:
+            raise ValueError(f"AWS::ApplicationAutoScaling::ScalingPolicy ScalingTargetId {target_id} is invalid")
+        return {"ResourceId": parts[0], "ScalableDimension": parts[1], "ServiceNamespace": parts[2]}
+    if not all(explicit):
+        raise ValueError("AWS::ApplicationAutoScaling::ScalingPolicy requires ScalingTargetId or "
+                         "ResourceId, ScalableDimension and ServiceNamespace")
+    return _aas_target_identity(props)
+
+
+def _aas_target_tracking_config(config):
+    config = copy.deepcopy(config)
+    if "TargetValue" in config:
+        config["TargetValue"] = _aas_number(config["TargetValue"])
+    for name in ("ScaleInCooldown", "ScaleOutCooldown"):
+        if name in config:
+            config[name] = _aas_int(config[name])
+    if "DisableScaleIn" in config:
+        config["DisableScaleIn"] = _cfn_bool(config["DisableScaleIn"])
+    return config
+
+
+def _aas_step_config(config):
+    config = copy.deepcopy(config)
+    for name in ("Cooldown", "MinAdjustmentMagnitude"):
+        if name in config:
+            config[name] = _aas_int(config[name])
+    for step in config.get("StepAdjustments") or []:
+        if isinstance(step, dict):
+            if "ScalingAdjustment" in step:
+                step["ScalingAdjustment"] = _aas_int(step["ScalingAdjustment"])
+            for name in ("MetricIntervalLowerBound", "MetricIntervalUpperBound"):
+                if name in step:
+                    step[name] = _aas_number(step[name])
+    return config
+
+
+def _aas_put_policy(props, what):
+    identity = _aas_policy_identity(props)
+    payload = dict(identity, PolicyName=props.get("PolicyName"), PolicyType=props.get("PolicyType"))
+    if isinstance(props.get("TargetTrackingScalingPolicyConfiguration"), dict):
+        payload["TargetTrackingScalingPolicyConfiguration"] = _aas_target_tracking_config(
+            props["TargetTrackingScalingPolicyConfiguration"])
+    if isinstance(props.get("StepScalingPolicyConfiguration"), dict):
+        payload["StepScalingPolicyConfiguration"] = _aas_step_config(props["StepScalingPolicyConfiguration"])
+    if props.get("PredictiveScalingPolicyConfiguration"):
+        payload["PredictiveScalingPolicyConfiguration"] = props["PredictiveScalingPolicyConfiguration"]
+    arn = _aas_result(_aas.call("PutScalingPolicy", payload), what)["PolicyARN"]
+    return arn, {"Arn": arn}
+
+
+def _aas_policy_create(logical_id, props, stack_name):
+    if not props.get("PolicyName"):
+        raise ValueError("AWS::ApplicationAutoScaling::ScalingPolicy requires PolicyName")
+    return _aas_put_policy(props, "AWS::ApplicationAutoScaling::ScalingPolicy create")
+
+
+def _aas_policy_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """PolicyType and the policy configurations change in place."""
+    return _aas_put_policy(new_props, "AWS::ApplicationAutoScaling::ScalingPolicy update")
+
+
+def _aas_policy_delete(physical_id, props):
+    for policy in list(_aas._policies.values()):
+        if policy["PolicyARN"] == physical_id:
+            _aas_result(_aas.call("DeleteScalingPolicy", {
+                name: policy[name] for name in _AAS_IDENTITY + ("PolicyName",)
+            }), "AWS::ApplicationAutoScaling::ScalingPolicy delete", missing_ok=True)
+            return
+
+
+# ---------------------------------------------------------------------------
 # EFS (AWS::EFS::*) — through efs.py; create-only properties are replaced by the engine.
 # ---------------------------------------------------------------------------
 
@@ -14586,6 +14800,10 @@ def _location_tracker_delete(physical_id, props):
 
 # Per type, the create-only properties (Always): a change replaces the resource.
 _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "AWS::ApplicationAutoScaling::ScalableTarget": ("ResourceId", "ScalableDimension", "ServiceNamespace"),
+    "AWS::ApplicationAutoScaling::ScalingPolicy": (
+        "PolicyName", "ResourceId", "ScalableDimension", "ScalingTargetId", "ServiceNamespace",
+    ),
     "AWS::DocDB::DBCluster": ("AvailabilityZones", "DBClusterIdentifier", "DBSubnetGroupName", "KmsKeyId",
                               "MasterUsername", "SnapshotIdentifier", "SourceDBClusterIdentifier",
                               "StorageEncrypted"),
@@ -15387,6 +15605,18 @@ _RESOURCE_HANDLERS = {
         "delete": _r53_hosted_zone_delete,
     },
     "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "update": _r53_record_set_update, "delete": _r53_record_set_delete},
+    "AWS::ApplicationAutoScaling::ScalableTarget": {
+        "create": _aas_target_create,
+        "update": _aas_target_update,
+        "update_with_logical_id": True,
+        "delete": _aas_target_delete,
+    },
+    "AWS::ApplicationAutoScaling::ScalingPolicy": {
+        "create": _aas_policy_create,
+        "update": _aas_policy_update,
+        "update_with_logical_id": True,
+        "delete": _aas_policy_delete,
+    },
     "AWS::ServiceDiscovery::HttpNamespace": {
         "create": _sd_namespace_create_for("HTTP"),
         "update": _sd_namespace_update_for("HTTP"),
