@@ -891,6 +891,11 @@ def vpclattice():
 
 
 @pytest.fixture(scope="session")
+def schemas():
+    return make_client("schemas")
+
+
+@pytest.fixture(scope="session")
 def appconfig_client():
     return make_client("appconfig")
 
