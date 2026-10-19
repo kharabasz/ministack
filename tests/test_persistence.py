@@ -5230,6 +5230,53 @@ def test_apigateway_v1_region_scoped_state_is_rejected_by_v2_reader(
     assert persistence.load_state("apigateway_v1") is None
 
 
+def test_apigateway_v1_rest_api_restored_without_status_fields():
+    """A REST API saved before apiStatus and rootResourceId were stored is
+    returned with apiStatus AVAILABLE and the id of its "/" resource."""
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import apigateway_v1 as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    region = "us-west-2"
+    api_id = "oldapi01"
+
+    rest_apis = AccountRegionScopedDict()
+    rest_apis.set_scoped(account_id, region, api_id, {"id": api_id, "name": "old API"})
+    resources = AccountRegionScopedDict()
+    resources.set_scoped(account_id, region, api_id, {
+        "root0001": {"id": "root0001", "parentId": None, "pathPart": "", "path": "/",
+                     "resourceMethods": {}},
+        "child001": {"id": "child001", "parentId": "root0001", "pathPart": "items",
+                     "path": "/items", "resourceMethods": {}},
+    })
+
+    service.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        service.load_persisted_state({"rest_apis": rest_apis, "resources": resources})
+
+        assert "apiStatus" not in service._rest_apis[api_id]
+        _status, _headers, body = service._get_rest_api(api_id)
+        api = _json.loads(body)
+        assert api["apiStatus"] == "AVAILABLE"
+        assert api["rootResourceId"] == "root0001"
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_opensearch_is_registered_for_persistence_save():
     from ministack.app import _build_persistence_save_dict, _state_map
     from ministack.services import opensearch

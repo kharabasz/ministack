@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **API Gateway — REST API `apiStatus` and `rootResourceId`** — REST APIs had neither field, so Terraform AWS provider 6.x timed out after `CreateRestApi` waiting for `apiStatus` `AVAILABLE`; `CreateRestApi`, `GetRestApi`, `GetRestApis` and `UpdateRestApi` now return `apiStatus` `AVAILABLE` and the `/` resource's id as `rootResourceId`, as do CloudFormation REST APIs created from a `Body` and REST APIs restored from earlier persisted state. Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
