@@ -896,6 +896,11 @@ def schemas():
 
 
 @pytest.fixture(scope="session")
+def appautoscaling():
+    return make_client("application-autoscaling")
+
+
+@pytest.fixture(scope="session")
 def appconfig_client():
     return make_client("appconfig")
 

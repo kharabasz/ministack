@@ -201,6 +201,7 @@ def test_iot_jobs_data_host_routes_before_iot(host):
 _TOKEN_ROUTES = {
     "account": "account", "acm": "acm", "airflow": "airflow", "aos": "opensearch",
     "apigateway": "apigateway", "appconfig": "appconfig",
+    "application-autoscaling": "application-autoscaling",
     "appconfigdata": "appconfigdata", "appsync": "appsync",
     "appsync-api": "appsync-events", "appsync-realtime-api": "appsync-events",
     "athena": "athena", "autoscaling": "autoscaling", "backup": "backup",
