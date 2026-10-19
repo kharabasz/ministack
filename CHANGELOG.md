@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EventBridge — archive KMS keys** — `CreateArchive` and `UpdateArchive` dropped `KmsKeyIdentifier`, so `DescribeArchive` never returned it and Terraform re-planned `kms_key_identifier` on every run; the key is now stored and returned, an update that omits it keeps it, and an empty identifier on update clears it. Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
