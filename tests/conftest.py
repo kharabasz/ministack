@@ -879,6 +879,8 @@ def vpclattice():
 @pytest.fixture(scope="session")
 def schemas():
     return make_client("schemas")
+def appautoscaling():
+    return make_client("application-autoscaling")
 
 
 @pytest.fixture(scope="session")

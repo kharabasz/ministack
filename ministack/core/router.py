@@ -424,6 +424,11 @@ SERVICE_PATTERNS = {
     "appsync-events": {
         "host_patterns": [r"appsync-api\.", r"appsync-realtime-api\."],
     },
+    "application-autoscaling": {
+        "target_prefixes": ["AnyScaleFrontendService"],
+        "host_patterns": [r"application-autoscaling\."],
+        "credential_scope": "application-autoscaling",
+    },
     "servicediscovery": {
         "target_prefixes": ["Route53AutoNaming_v20170314"],
         "host_patterns": [r"servicediscovery\."],
@@ -869,6 +874,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "iotdevicegateway": "iot-data",
                 "appsync": "appsync",
                 "servicediscovery": "servicediscovery",
+                "application-autoscaling": "application-autoscaling",
                 "s3files": "s3files",
                 "rds-data": "rds-data",
                 "vpc-lattice": "vpc-lattice",
