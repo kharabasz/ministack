@@ -874,6 +874,9 @@ def rds_data():
 @pytest.fixture(scope="session")
 def vpclattice():
     return make_client("vpc-lattice")
+
+
+@pytest.fixture(scope="session")
 def schemas():
     return make_client("schemas")
 
