@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Route 53 — private hosted zones keep their VPCs** — `CreateHostedZone` with a `VPC` made a public zone and dropped the VPC, so Terraform re-planned the association forever; the zone is now private, `GetHostedZone` returns its `VPCs` (and no delegation set), and `AssociateVPCWithHostedZone`, `DisassociateVPCFromHostedZone` and `ListHostedZonesByVPC` keep the list, refusing a public zone (`PublicZoneVPCAssociation`), a duplicate (`ConflictingDomainExists`), an unknown VPC (`VPCAssociationNotFound`) and the last association (`LastVPCAssociation`). A private zone requested without a VPC answers `InvalidInput`.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

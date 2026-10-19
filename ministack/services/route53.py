@@ -8,6 +8,8 @@ Supports:
   Hosted Zones:   CreateHostedZone, GetHostedZone, DeleteHostedZone,
                   ListHostedZones, ListHostedZonesByName,
                   UpdateHostedZoneComment
+  Private zones:  AssociateVPCWithHostedZone, DisassociateVPCFromHostedZone,
+                  ListHostedZonesByVPC
   Record Sets:    ChangeResourceRecordSets, ListResourceRecordSets
   Changes:        GetChange
   Health Checks:  CreateHealthCheck, GetHealthCheck, DeleteHealthCheck,
@@ -31,7 +33,7 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 
 from defusedxml.ElementTree import fromstring
 
-from ministack.core.responses import AccountScopedDict, new_uuid
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("route53")
 
@@ -241,6 +243,23 @@ def _build_hosted_zone_el(parent: Element, zone: dict):
     )
 
 
+def _build_vpc_el(parent: Element, vpc: dict):
+    el = SubElement(parent, "VPC")
+    SubElement(el, "VPCRegion").text = vpc["VPCRegion"]
+    SubElement(el, "VPCId").text = vpc["VPCId"]
+
+
+def _parse_vpc(root):
+    """The request's <VPC> element as {VPCRegion, VPCId}, or None when absent."""
+    vpc_el = _find(root, "VPC")
+    if vpc_el is None:
+        return None, None
+    vpc_id = _text(vpc_el, "VPCId")
+    if not vpc_id:
+        return None, _error_response("InvalidVPCId", "The VPC ID is missing.")
+    return {"VPCRegion": _text(vpc_el, "VPCRegion") or get_region(), "VPCId": vpc_id}, None
+
+
 def _build_delegation_set_el(parent: Element, zone_name: str):
     ds = SubElement(parent, "DelegationSet")
     SubElement(ds, "NameServers")
@@ -429,6 +448,14 @@ def _create_hosted_zone(body: bytes, query_params: dict):
     cfg_el = _find(root, "HostedZoneConfig")
     comment = _text(cfg_el, "Comment") if cfg_el is not None else ""
     private = _text(cfg_el, "PrivateZone", "false").lower() == "true" if cfg_el is not None else False
+    # A VPC in the request makes the zone private and is its first association.
+    vpc, err = _parse_vpc(root)
+    if err:
+        return err
+    if vpc:
+        private = True
+    elif private:
+        return _error_response("InvalidInput", "A private hosted zone requires a VPC.")
 
     with _lock:
         if caller_ref in _caller_refs:
@@ -448,6 +475,7 @@ def _create_hosted_zone(body: bytes, query_params: dict):
             "caller_reference": caller_ref,
             "comment": comment,
             "private": private,
+            "vpcs": [vpc] if vpc else [],
         }
         _zones[zone_id] = zone
         _records[zone_id] = _default_records(name)
@@ -460,7 +488,10 @@ def _create_hosted_zone(body: bytes, query_params: dict):
     def build(root):
         _build_hosted_zone_el(root, zone)
         _build_change_info_el(root, change)
-        _build_delegation_set_el(root, name)
+        if vpc:
+            _build_vpc_el(root, vpc)
+        else:
+            _build_delegation_set_el(root, name)
 
     return _xml_response("CreateHostedZoneResponse", build, 201)
 
@@ -473,7 +504,12 @@ def _get_hosted_zone(zone_id: str):
 
     def build(root):
         _build_hosted_zone_el(root, zone)
-        _build_delegation_set_el(root, zone["name"])
+        if zone.get("private"):
+            vpcs_el = SubElement(root, "VPCs")
+            for vpc in zone.get("vpcs", []):
+                _build_vpc_el(vpcs_el, vpc)
+        else:
+            _build_delegation_set_el(root, zone["name"])
 
     return _xml_response("GetHostedZoneResponse", build)
 
@@ -747,6 +783,92 @@ def _get_change(change_id: str):
     return _xml_response("GetChangeResponse", build)
 
 
+# ─── private zone VPC associations ────────────────────────────────────────────
+
+def _new_change():
+    change = {"id": _change_id(), "status": "PENDING", "submitted_at": _now_iso(), "comment": ""}
+    _changes[change["id"]] = change
+    return change
+
+
+def _associate_vpc(zone_id: str, body: bytes):
+    root = _parse_body(body)
+    if root is None:
+        return _error_response("InvalidInput", "Missing or invalid request body.")
+    vpc, err = _parse_vpc(root)
+    if err:
+        return err
+    if not vpc:
+        return _error_response("InvalidInput", "VPC is required.")
+    with _lock:
+        zone = _zones.get(zone_id)
+        if not zone:
+            return _error_response("NoSuchHostedZone", f"No hosted zone found with ID: {zone_id}", 404)
+        if not zone.get("private"):
+            return _error_response("PublicZoneVPCAssociation",
+                                   "You can't associate a VPC with a public hosted zone.")
+        vpcs = zone.setdefault("vpcs", [])
+        if vpc in vpcs:
+            return _error_response(
+                "ConflictingDomainExists",
+                f"The VPC {vpc['VPCId']} in {vpc['VPCRegion']} is already associated with the hosted zone.")
+        vpcs.append(vpc)
+        change = _new_change()
+    return _xml_response("AssociateVPCWithHostedZoneResponse",
+                         lambda root: _build_change_info_el(root, change))
+
+
+def _disassociate_vpc(zone_id: str, body: bytes):
+    root = _parse_body(body)
+    if root is None:
+        return _error_response("InvalidInput", "Missing or invalid request body.")
+    vpc, err = _parse_vpc(root)
+    if err:
+        return err
+    if not vpc:
+        return _error_response("InvalidInput", "VPC is required.")
+    with _lock:
+        zone = _zones.get(zone_id)
+        if not zone:
+            return _error_response("NoSuchHostedZone", f"No hosted zone found with ID: {zone_id}", 404)
+        vpcs = zone.get("vpcs", [])
+        if vpc not in vpcs:
+            return _error_response(
+                "VPCAssociationNotFound",
+                f"The VPC {vpc['VPCId']} in {vpc['VPCRegion']} is not associated with the hosted zone.", 404)
+        if len(vpcs) == 1:
+            return _error_response("LastVPCAssociation",
+                                   "A private hosted zone must stay associated with at least one VPC.")
+        vpcs.remove(vpc)
+        change = _new_change()
+    return _xml_response("DisassociateVPCFromHostedZoneResponse",
+                         lambda root: _build_change_info_el(root, change))
+
+
+def _list_hosted_zones_by_vpc(query_params: dict):
+    def q(name):
+        v = query_params.get(name, "")
+        return v[0] if isinstance(v, list) else v
+    vpc_id, vpc_region = q("vpcid"), q("vpcregion")
+    if not vpc_id or not vpc_region:
+        return _error_response("InvalidInput", "vpcid and vpcregion are required.")
+    target = {"VPCRegion": vpc_region, "VPCId": vpc_id}
+    with _lock:
+        zones = [z for z in _zones.values() if target in z.get("vpcs", [])]
+
+    def build(root):
+        summaries = SubElement(root, "HostedZoneSummaries")
+        for zone in zones:
+            item = SubElement(summaries, "HostedZoneSummary")
+            SubElement(item, "HostedZoneId").text = zone["id"]
+            SubElement(item, "Name").text = zone["name"]
+            owner = SubElement(item, "Owner")
+            SubElement(owner, "OwningAccount").text = get_account_id()
+        SubElement(root, "MaxItems").text = q("maxitems") or "100"
+
+    return _xml_response("ListHostedZonesByVPCResponse", build)
+
+
 # ─── health checks ────────────────────────────────────────────────────────────
 
 def _create_health_check(body: bytes):
@@ -923,6 +1045,17 @@ async def handle_request(method, path, headers, body, query_params):
     # GET /hostedzonesbyname
     if method == "GET" and p == "/hostedzonesbyname":
         return _list_hosted_zones_by_name(query_params)
+
+    # GET /hostedzonesbyvpc
+    if method == "GET" and p == "/hostedzonesbyvpc":
+        return _list_hosted_zones_by_vpc(query_params)
+
+    # POST /hostedzone/{id}/associatevpc | /disassociatevpc
+    m = re.match(r"^/hostedzone/([^/]+)/(associatevpc|disassociatevpc)$", p)
+    if m and method == "POST":
+        if m.group(2) == "associatevpc":
+            return _associate_vpc(m.group(1), body)
+        return _disassociate_vpc(m.group(1), body)
 
     # GET|DELETE|POST /hostedzone/{id}
     m = re.match(r"^/hostedzone/([^/]+)$", p)
