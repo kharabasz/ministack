@@ -9543,6 +9543,29 @@ def _flatten_listener_rule_conditions(cfn_conditions):
     return out
 
 
+def _elbv2_listener_rule_transforms(props, logical_id):
+    """CFN ``Transforms`` use the API's RuleTransform shape (Type plus a
+    UrlRewriteConfig or HostHeaderRewriteConfig holding ``Rewrites``), per
+    https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-properties-elasticloadbalancingv2-listenerrule-transform.html,
+    so they are stored as the ALB service stores CreateRule's and checked by
+    the same rules.
+    """
+    transforms = []
+    for raw in props.get("Transforms") or []:
+        transform = {"Type": str(raw.get("Type", ""))}
+        for config in _alb._TRANSFORM_CONFIG_KEYS.values():
+            if raw.get(config) is not None:
+                transform[config] = {"Rewrites": [
+                    {"Regex": str(r.get("Regex", "")), "Replace": str(r.get("Replace", ""))}
+                    for r in (raw[config] or {}).get("Rewrites") or []
+                ]}
+        transforms.append(transform)
+    problem = _alb._transforms_problem(transforms)
+    if problem:
+        raise ValueError(f"ListenerRule {logical_id}: {problem}")
+    return transforms
+
+
 def _elbv2_listener_rule_create(logical_id, props, stack_name):
     """Provision an AWS::ElasticLoadBalancingV2::ListenerRule. Conditions and
     Actions match the shape MS' ALB stores in `_alb._rules`.
@@ -9557,6 +9580,7 @@ def _elbv2_listener_rule_create(logical_id, props, stack_name):
     lb_name = _alb._lbs[lb_arn]["LoadBalancerName"]
     lb_id = _alb._load_balancer_id_from_arn(lb_arn)
     l_id = _alb._listener_id_from_arn(l_arn)
+    transforms = _elbv2_listener_rule_transforms(props, logical_id)
     import random as _random
     import string as _string
     rule_id = "".join(_random.choices(_string.ascii_lowercase + _string.digits, k=16))
@@ -9571,6 +9595,7 @@ def _elbv2_listener_rule_create(logical_id, props, stack_name):
         "Conditions": _flatten_listener_rule_conditions(props.get("Conditions") or []),
         "Actions": _elbv2_listener_actions(props, None, prop="Actions"),
         "IsDefault": False,
+        "Transforms": transforms,
     }
     _alb._rules[rule_arn] = rule
     return rule_arn, {"RuleArn": rule_arn}
@@ -9583,8 +9608,8 @@ def _elbv2_listener_rule_delete(physical_id, props):
 def _elbv2_listener_rule_update(physical_id, old_props, new_props, stack_name,
                                 logical_id=None):
     """Update a listener rule in place, keeping its ARN (what ``Ref``
-    returns). ``Actions``, ``Conditions`` and ``Priority`` are "Update
-    requires: No interruption" and only ``ListenerArn`` requires replacement
+    returns). ``Actions``, ``Conditions``, ``Priority`` and ``Transforms`` are
+    "Update requires: No interruption" and only ``ListenerArn`` requires replacement
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-listenerrule.html);
     a rule ARN carries its listener, so moving one is a replacement under a
     new physical id. ``Tags`` are left alone, because the create handler does
@@ -9598,9 +9623,11 @@ def _elbv2_listener_rule_update(physical_id, old_props, new_props, stack_name,
             _delete_predecessor(_elbv2_listener_rule_delete, physical_id, old_props)
         return created
 
+    transforms = _elbv2_listener_rule_transforms(new_props, logical_id or physical_id)
     rule["Priority"] = str(new_props.get("Priority", 1))
     rule["Conditions"] = _flatten_listener_rule_conditions(new_props.get("Conditions") or [])
     rule["Actions"] = _elbv2_listener_actions(new_props, None, prop="Actions")
+    rule["Transforms"] = transforms
     return physical_id, {"RuleArn": physical_id}
 
 

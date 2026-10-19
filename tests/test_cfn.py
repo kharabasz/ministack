@@ -8122,7 +8122,7 @@ def _cfn_elbv2_template(uid, *, health_path="/a", idle_timeout="60",
                         priority=10, scheme="internet-facing", name=None,
                         tg_port=80, listener_port=80, listener_protocol="HTTP",
                         listener_actions=None, listener_lb="LB",
-                        second_lb=False):
+                        second_lb=False, rule_transforms=None):
     resources = {
         "LB": {
             "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
@@ -8166,6 +8166,7 @@ def _cfn_elbv2_template(uid, *, health_path="/a", idle_timeout="60",
                     {"Field": "path-pattern", "Values": [f"{health_path}*"]},
                 ],
                 "Actions": [{"Type": "forward", "TargetGroupArn": {"Ref": "TG"}}],
+                **({"Transforms": rule_transforms} if rule_transforms is not None else {}),
             },
         },
     }
@@ -8231,6 +8232,36 @@ def test_cfn_elbv2_update_keeps_the_arns_and_the_registered_targets(cfn, elbv2):
             ListenerArn=listener_arn)["Rules"]}
         assert rules[rule_arn]["Priority"] == "20"
         assert rules[rule_arn]["Conditions"][0]["Values"] == ["/b*"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_elbv2_listener_rule_transforms_are_created_updated_and_removed(cfn, elbv2):
+    """ListenerRule Transforms use the API's RuleTransform shape and are "Update
+    requires: No interruption", so DescribeRules shows the template's transforms
+    after create and each update, on the same rule ARN."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-elbv2-tx-{uid}"
+    url_rewrite = [{"Type": "url-rewrite", "UrlRewriteConfig": {
+        "Rewrites": [{"Regex": "^/a/(.*)$", "Replace": "/$1"}]}}]
+    host_rewrite = [{"Type": "host-header-rewrite", "HostHeaderRewriteConfig": {
+        "Rewrites": [{"Regex": "^www\\.example\\.com$", "Replace": "example.com"}]}}]
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_elbv2_template(uid, rule_transforms=url_rewrite))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        rule_arn = _output(stack, "RuleRef")
+        assert elbv2.describe_rules(RuleArns=[rule_arn])["Rules"][0]["Transforms"] == url_rewrite
+
+        for transforms, expected in ((host_rewrite, host_rewrite), (None, [])):
+            cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_elbv2_template(
+                uid, rule_transforms=transforms))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            assert _output(stack, "RuleRef") == rule_arn
+            assert elbv2.describe_rules(RuleArns=[rule_arn])["Rules"][0]["Transforms"] == expected
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 

@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **ELBv2 — listener rule transforms** — `CreateRule` and `ModifyRule` dropped `Transforms`, so Terraform re-planned every `aws_lb_listener_rule` with a `transform` block; `url-rewrite` and `host-header-rewrite` transforms are now stored, returned by `DescribeRules` (an empty list for a rule without any), replaced by `ModifyRule` and cleared by `ResetTransforms`, and CloudFormation creates and updates them on `AWS::ElasticLoadBalancingV2::ListenerRule`. An unknown type, a second transform of one type, a config that doesn't match the type, anything other than one rewrite, an empty `Regex`, `Transforms` together with `ResetTransforms`, or transforms on a default rule answer `ValidationError`. The data plane does not apply transforms yet: requests reach targets with their original path, query string and Host header. Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
