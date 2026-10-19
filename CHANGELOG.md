@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **VPC Lattice — service network control plane** — new `vpc-lattice` service: service networks (create, get by ID, ARN or name, update `authType`, delete, list), VPC associations (`ACTIVE` on create, `DELETE_IN_PROGRESS` on delete), auth policies (`Active` only when the network's auth type is `AWS_IAM`), access log subscriptions to S3, CloudWatch Logs or Firehose, and tags, per account and region. Duplicate names, duplicate VPC associations, a second subscription to the same destination type, and deleting a network that still has VPC associations answer `ConflictException`; unknown identifiers answer `ResourceNotFoundException`. No services, target groups, listeners or routing.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
