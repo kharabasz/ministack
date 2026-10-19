@@ -14564,17 +14564,25 @@ def test_execute_function_generates_one_request_id(monkeypatch, log_state, mode,
     assert emit.call_args.args[1] == "invocation-id"
 
 
-@pytest.mark.parametrize("runtime", ["dotnet8", "dotnet10"])
-def test_dotnet_zip_functions_run_in_the_official_image(monkeypatch, log_state, runtime):
-    """dotnet zip functions go to the Docker executor and the AWS base image, whatever LAMBDA_EXECUTOR says."""
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("unavailable", ["sdk", "daemon"])
+@pytest.mark.parametrize("runtime", ["java21", "dotnet8", "ruby3.3"])
+def test_docker_only_zip_runtime_without_docker(monkeypatch, log_state, runtime, unavailable, strict):
+    """java/dotnet/ruby zips go to Docker even with the local executor. Without Docker they get the
+    placeholder body, or a function error under LAMBDA_STRICT (README: Lambda in Docker)."""
     func = _function(runtime, b"zip")
-    monkeypatch.setattr(_svc, "LAMBDA_EXECUTOR", "local")
-    monkeypatch.setattr(_svc, "LAMBDA_STRICT", False)
-    docker_exec = Mock(return_value={"body": {}, "log": ""})
-    monkeypatch.setattr(_svc, "_execute_function_docker", docker_exec)
-    _svc._execute_function_dispatch(func, func["config"], {}, "dotnet-id", time.time())
-    docker_exec.assert_called_once_with(func, {}, "dotnet-id")
-    assert _svc._RUNTIME_IMAGE_MAP[runtime] == f"public.ecr.aws/lambda/dotnet:{runtime[len('dotnet'):]}"
+    monkeypatch.setattr(_svc, "_docker_available", unavailable != "sdk")
+    monkeypatch.setattr(_svc, "_get_docker_client", lambda: None)
+    monkeypatch.setattr(_svc, "LAMBDA_STRICT", strict)
+    result = _svc._execute_function(func, {})
+    if strict:
+        assert result.get("error") is True
+        assert result["body"]["errorType"] == (
+            "Runtime.DockerUnavailable" if unavailable == "sdk" else "Runtime.DockerError")
+    else:
+        assert not result.get("error")
+        assert result["body"] == {
+            "statusCode": 200, "body": f"Mock response - {runtime} not supported for local execution"}
 
 
 @pytest.mark.parametrize("unavailable", ["sdk", "daemon"])
