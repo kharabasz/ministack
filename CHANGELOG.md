@@ -13,6 +13,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 - **Route 53 — private hosted zones keep their VPC** — `CreateHostedZone` with a `VPC` made a public zone and dropped the VPC, so Terraform's `aws_route53_zone` with a `vpc` block planned to add it again on every run; the zone is now private, the response carries the `VPC` instead of a delegation set, also on a `CallerReference` replay, and `GetHostedZone` returns its `VPCs`. Contributed by @kharabasz.
 - **ELBv2 — listener `SslPolicy` and certificate** — `CreateListener` and `ModifyListener` dropped `SslPolicy` and `Certificates`, so `DescribeListeners` returned neither and Terraform re-planned `ssl_policy` on every HTTPS listener; HTTPS and TLS listeners now keep and return both, the policy defaults to `ELBSecurityPolicy-2016-08`, a listener moved to HTTP or TCP drops them, and more than one default certificate answers `ValidationError`. Contributed by @kharabasz.
+- **CloudFront — `CreateFunction` tags** — the request's `Tags` were dropped, so `ListTagsForResource` on the new function's ARN was empty; they are now stored, and `DeleteFunction` removes them so a function created again under the same name starts without them. Contributed by @kharabasz.
+- **CloudWatch — `PutMetricAlarm` tags on create** — `Tags` were dropped when the call created an alarm; they are now stored, and, as the API reference documents, they are still ignored when the call updates an existing alarm (use `TagResource` / `UntagResource`). Contributed by @kharabasz.
+- **CloudWatch — `DatapointsToAlarm` only when set** — an alarm created by `PutMetricAlarm` or `AWS::CloudWatch::Alarm` without `DatapointsToAlarm` reported it as `EvaluationPeriods`; `DescribeAlarms` now leaves it out unless the request or template sets it (and the Query response includes it when set). An update that omits it clears it. Contributed by @kharabasz.
 
 ## [1.5.30] — 2026-10-20
 

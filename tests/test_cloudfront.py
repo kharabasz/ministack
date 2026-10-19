@@ -3066,3 +3066,66 @@ def test_cloudfront_get_distribution_xml_has_no_namespace_prefixes(cloudfront):
         raw = resp.read()
     assert b"ns0:" not in raw, "namespace prefixes leaked into the response XML"
     assert b"<Origins>" in raw and b"<DefaultCacheBehavior>" in raw
+
+
+
+def _cf_create_tagged_function(cloudfront, name, **kwargs):
+    return cloudfront.create_function(
+        Name=name, FunctionConfig={"Comment": "", "Runtime": "cloudfront-js-2.0"},
+        FunctionCode=b"function handler(event) { return event.request; }", **kwargs)
+
+
+def _cf_delete_function_if_present(cloudfront, name):
+    try:
+        etag = cloudfront.describe_function(Name=name)["ETag"]
+    except ClientError:
+        return
+    cloudfront.delete_function(Name=name, IfMatch=etag)
+
+
+def _cf_tag_items(cloudfront, arn):
+    return cloudfront.list_tags_for_resource(Resource=arn)["Tags"].get("Items", [])
+
+
+def test_cloudfront_create_function_stores_request_tags(cloudfront):
+    """CreateFunctionRequest's Tags are listed on the function ARN, and
+    TagResource / UntagResource then change that same set."""
+    name = f"tagged-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(
+            cloudfront, name, Tags={"Items": [{"Key": "environment", "Value": "dev"}]})
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        assert _cf_tag_items(cloudfront, arn) == [{"Key": "environment", "Value": "dev"}]
+
+        cloudfront.tag_resource(Resource=arn, Tags={"Items": [{"Key": "team", "Value": "edge"}]})
+        cloudfront.untag_resource(Resource=arn, TagKeys={"Items": ["environment"]})
+        assert _cf_tag_items(cloudfront, arn) == [{"Key": "team", "Value": "edge"}]
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_create_function_with_empty_tags_has_none(cloudfront):
+    name = f"untagged-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(cloudfront, name, Tags={"Items": []})
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        assert _cf_tag_items(cloudfront, arn) == []
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_delete_function_drops_its_tags(cloudfront):
+    """A function created again under a deleted function's name (same ARN)
+    starts without the old function's tags."""
+    name = f"recreated-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(
+            cloudfront, name, Tags={"Items": [{"Key": "environment", "Value": "dev"}]})
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        cloudfront.delete_function(Name=name, IfMatch=fn["ETag"])
+
+        again = _cf_create_tagged_function(cloudfront, name)
+        assert again["FunctionSummary"]["FunctionMetadata"]["FunctionARN"] == arn
+        assert _cf_tag_items(cloudfront, arn) == []
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
