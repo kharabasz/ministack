@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **VPC Lattice — service network control plane** — new `vpc-lattice` service with the 21 operations behind Terraform's `aws_vpclattice_service_network`, `aws_vpclattice_service_network_vpc_association`, `aws_vpclattice_auth_policy` and `aws_vpclattice_access_log_subscription`: service networks, VPC associations, auth policies, access log subscriptions and tags, per account and region. Identifiers are an ID or an ARN, as the model's patterns allow, and a malformed one answers `ValidationException`. Creates honour `clientToken`, and lists honour `maxResults` and `nextToken`. An auth policy's `state` is `Active` only while the network's `authType` is `AWS_IAM`. Deleting a network removes its auth policy and access log subscriptions, and is refused with `ConflictException` while VPCs are still associated. Under `AUTH=true` each operation needs its `vpc-lattice:` action. Services, target groups, listeners, rules, resource configurations and request routing are not emulated. Contributed by @kharabasz.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

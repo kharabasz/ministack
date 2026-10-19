@@ -115,6 +115,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "transcribe": "transcribe",
     "translate": "translate",
     "transfer": "transfer",
+    "vpc-lattice": "vpc-lattice",
     "waf": "waf",
     "waf-regional": "waf-regional",
     "wafv2": "wafv2",
@@ -555,6 +556,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "s3tables": ["s3tables"],
     "scheduler": ["scheduler"],
     "signer": ["signer"],
+    "vpc-lattice": ["vpc-lattice"],
 }
 
 # Compiled route: (http_method, compiled_regex, operation_name, specificity)
@@ -1540,6 +1542,9 @@ def extract_resource_arn(service: str, method: str, path: str,
                 return f"arn:aws:resource-groups:{region}:{account_id}:group/{parts[gi + 1]}"
         return "*"
 
+    if service == "vpc-lattice":
+        return _vpc_lattice_resource_arn(method, path, body, region, account_id)
+
     if service == "rds-data":
         arn = _safe_json_field(body, "resourceArn")
         if arn:
@@ -1728,6 +1733,47 @@ def extract_resource_arn(service: str, method: str, path: str,
                 return f"arn:aws:appsync:{region}:{account_id}:apis/{api_id}"
         return "*"
 
+    return "*"
+
+
+_VPC_LATTICE_PATH_TYPES = {
+    "servicenetworks": "servicenetwork",
+    "servicenetworkvpcassociations": "servicenetworkvpcassociation",
+    "accesslogsubscriptions": "accesslogsubscription",
+    "authpolicy": "servicenetwork",
+}
+_VPC_LATTICE_ID_TYPES = {"sn": "servicenetwork", "snva": "servicenetworkvpcassociation",
+                         "als": "accesslogsubscription"}
+
+
+def _vpc_lattice_arn(identifier: str, region: str, account_id: str) -> str:
+    """An ID or ARN identifier as the resource ARN the Service Authorization
+    Reference lists (servicenetwork/, servicenetworkvpcassociation/,
+    accesslogsubscription/)."""
+    if identifier.startswith("arn:"):
+        return identifier
+    resource_type = _VPC_LATTICE_ID_TYPES.get(identifier.split("-", 1)[0])
+    if not resource_type:
+        return "*"
+    return f"arn:aws:vpc-lattice:{region}:{account_id}:{resource_type}/{identifier}"
+
+
+def _vpc_lattice_resource_arn(method: str, path: str, body: bytes,
+                              region: str, account_id: str) -> str:
+    path = unquote(path)
+    if path.startswith("/tags/"):
+        return path[len("/tags/"):] or "*"
+    collection, _, identifier = path.strip("/").partition("/")
+    if collection not in _VPC_LATTICE_PATH_TYPES:
+        return "*"
+    if identifier:
+        return _vpc_lattice_arn(identifier, region, account_id)
+    # CreateServiceNetworkVpcAssociation authorizes on the service network it
+    # names; other creates and the list operations have no resource yet.
+    if method == "POST" and collection == "servicenetworkvpcassociations":
+        sn = _safe_json_field(body, "serviceNetworkIdentifier")
+        if sn:
+            return _vpc_lattice_arn(sn, region, account_id)
     return "*"
 
 

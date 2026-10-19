@@ -5733,3 +5733,82 @@ def test_signer_jobs_profiles_and_tokens_survive_warm_boot():
         }
     finally:
         mod.reset()
+
+
+def test_vpc_lattice_state_round_trips_every_tenant(monkeypatch, tmp_path):
+    """Every VPC Lattice store survives save, reset and load for all
+    accounts and regions, not only the tenant of the last request."""
+    import asyncio
+    import json as _json
+
+    from ministack.app import _state_map
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import vpc_lattice
+
+    assert _state_map["vpc_lattice"] == "vpc_lattice"
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    policy = _json.dumps({"Version": "2012-10-17", "Statement": []})
+
+    def call(method, path, body=None, query=None):
+        raw = _json.dumps(body).encode() if body is not None else b""
+        status, _, out = asyncio.run(vpc_lattice.handle_request(method, path, {}, raw, query or {}))
+        return status, _json.loads(out) if out else {}
+
+    original_account, original_region = get_account_id(), get_region()
+    tenants = [("111111111111", "us-east-1"), ("222222222222", "eu-west-1")]
+    created = {}
+    vpc_lattice.reset()
+    try:
+        for account, region in tenants:
+            set_request_account_id(account)
+            set_request_region(region)
+            # The same name in both tenants: uniqueness is per account and region.
+            status, sn = call("POST", "/servicenetworks",
+                              {"name": "shared-name", "authType": "AWS_IAM", "tags": {"t": account},
+                               "clientToken": "tok"})
+            assert status == 201
+            status, assoc = call("POST", "/servicenetworkvpcassociations",
+                                 {"serviceNetworkIdentifier": sn["id"], "vpcIdentifier": "vpc-0123456789abcdef0"})
+            assert status == 200
+            assert call("PUT", f"/authpolicy/{sn['id']}", {"policy": policy})[0] == 200
+            status, sub = call("POST", "/accesslogsubscriptions",
+                               {"resourceIdentifier": sn["id"], "destinationArn": "arn:aws:s3:::logs"})
+            assert status == 201
+            created[(account, region)] = (sn, assoc, sub)
+
+        persistence.save_state("vpc_lattice", vpc_lattice.get_state())
+        vpc_lattice.reset()
+        for account, region in tenants:
+            set_request_account_id(account)
+            set_request_region(region)
+            assert call("GET", "/servicenetworks")[1]["items"] == []
+
+        vpc_lattice.load_persisted_state(persistence.load_state("vpc_lattice"))
+        for account, region in tenants:
+            set_request_account_id(account)
+            set_request_region(region)
+            sn, assoc, sub = created[(account, region)]
+            status, got = call("GET", f"/servicenetworks/{sn['id']}")
+            assert status == 200 and got["arn"] == sn["arn"] and f":{account}:" in sn["arn"]
+            assert got["numberOfAssociatedVPCs"] == 1
+            assert call("GET", f"/servicenetworkvpcassociations/{assoc['id']}")[0] == 200
+            assert call("GET", f"/authpolicy/{sn['arn']}")[1]["state"] == "Active"
+            assert call("GET", f"/accesslogsubscriptions/{sub['id']}")[0] == 200
+            assert call("GET", f"/tags/{sn['arn']}")[1]["tags"] == {"t": account}
+            # The idempotency token is restored too.
+            status, again = call("POST", "/servicenetworks",
+                                 {"name": "shared-name", "authType": "AWS_IAM", "tags": {"t": account},
+                                  "clientToken": "tok"})
+            assert status == 201 and again["id"] == sn["id"]
+            ids = [n["id"] for n in call("GET", "/servicenetworks")[1]["items"]]
+            assert ids == [sn["id"]]
+    finally:
+        vpc_lattice.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
