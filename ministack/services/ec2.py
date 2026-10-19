@@ -60,6 +60,10 @@ Supports:
   Launch Tmpl:     CreateLaunchTemplate, CreateLaunchTemplateVersion,
                    DescribeLaunchTemplates, DescribeLaunchTemplateVersions,
                    ModifyLaunchTemplate, DeleteLaunchTemplate
+  Verified Access: Create/Describe/Modify/Delete for instances, trust providers,
+                   groups and endpoints (load-balancer, network-interface);
+                   Attach/DetachVerifiedAccessTrustProvider; instance logging
+                   configuration; group and endpoint policies (control plane only)
 """
 
 import copy
@@ -132,6 +136,10 @@ _launch_templates = AccountRegionScopedDict()   # lt_id -> launch template recor
 _fleets = AccountRegionScopedDict()             # fleet_id -> fleet record
 _iam_instance_profile_associations = AccountRegionScopedDict()  # assoc_id -> association record
 _images = AccountRegionScopedDict()             # ami_id -> registered image record
+_va_instances = AccountRegionScopedDict()       # vai_id -> Verified Access instance record
+_va_trust_providers = AccountRegionScopedDict()  # vatp_id -> Verified Access trust provider record
+_va_groups = AccountRegionScopedDict()          # vagr_id -> Verified Access group record
+_va_endpoints = AccountRegionScopedDict()       # vae_id -> Verified Access endpoint record
 # Seed defaults once per account/region; do not recreate user-deleted defaults
 # on every later EC2 request in a scope.
 _default_initialized_scopes = set()
@@ -232,6 +240,10 @@ def get_state():
         "launch_templates": copy.deepcopy(_launch_templates),
         "fleets": copy.deepcopy(_fleets),
         "iam_instance_profile_associations": copy.deepcopy(_iam_instance_profile_associations),
+        "va_instances": copy.deepcopy(_va_instances),
+        "va_trust_providers": copy.deepcopy(_va_trust_providers),
+        "va_groups": copy.deepcopy(_va_groups),
+        "va_endpoints": copy.deepcopy(_va_endpoints),
     }
 
 
@@ -264,6 +276,10 @@ def _clear_state():
     _fleets.clear()
     _iam_instance_profile_associations.clear()
     _images.clear()
+    _va_instances.clear()
+    _va_trust_providers.clear()
+    _va_groups.clear()
+    _va_endpoints.clear()
     _default_initialized_scopes.clear()
 
 
@@ -378,6 +394,10 @@ def _restore_state(data):
         data.get("iam_instance_profile_associations", {})
     )
     _restore_regional_store(_images, data.get("images", {}))
+    _restore_regional_store(_va_instances, data.get("va_instances", {}))
+    _restore_regional_store(_va_trust_providers, data.get("va_trust_providers", {}))
+    _restore_regional_store(_va_groups, data.get("va_groups", {}))
+    _restore_regional_store(_va_endpoints, data.get("va_endpoints", {}))
     if "default_initialized_scopes" not in data:
         _infer_default_initialized_scopes_from_restored_stores()
     _reconcile_backed_instances_after_restore()
@@ -4817,6 +4837,10 @@ def _guess_resource_type(resource_id):
         "pg-": "placement-group",
         "ami-": "image",
         "tgw-": "transit-gateway",
+        "vai-": "verified-access-instance",
+        "vatp-": "verified-access-trust-provider",
+        "vagr-": "verified-access-group",
+        "vae-": "verified-access-endpoint",
     }
     for prefix, rtype in _PREFIX_MAP.items():
         if resource_id.startswith(prefix):
@@ -7230,6 +7254,776 @@ def _describe_fleets(p):
     return _xml(200, "DescribeFleetsResponse", f"<fleetSet>{fleet_set_xml}</fleetSet>")
 
 
+# ---------------------------------------------------------------------------
+# Verified Access (control plane)
+# ---------------------------------------------------------------------------
+# Instances, trust providers, groups, endpoints, trust provider attachments,
+# instance logging configuration and group/endpoint policies — the operations
+# the Terraform aws_verifiedaccess_* resources call. No access evaluation.
+# Shapes follow the botocore ec2 model. AWS does not return OIDC client
+# secrets on reads (the Terraform provider keeps them from configuration),
+# so stored secrets are never echoed.
+
+_VA_TRUST_PROVIDER_TYPES = ("user", "device")
+_VA_USER_TRUST_PROVIDER_TYPES = ("iam-identity-center", "oidc")
+_VA_DEVICE_TRUST_PROVIDER_TYPES = ("jamf", "crowdstrike", "jumpcloud")
+_VA_ENDPOINT_TYPES = ("load-balancer", "network-interface", "rds", "cidr")
+# rds and cidr endpoints carry options MiniStack does not model yet.
+_VA_UNSUPPORTED_ENDPOINT_TYPES = ("rds", "cidr")
+_VA_OIDC_FIELDS = ("Issuer", "AuthorizationEndpoint", "TokenEndpoint",
+                   "UserInfoEndpoint", "ClientId", "ClientSecret", "Scope")
+_VA_NATIVE_OIDC_FIELDS = _VA_OIDC_FIELDS + ("PublicSigningKeyEndpoint",)
+_VA_DEFAULT_LOG_VERSION = "ocsf-0.1"
+
+
+def _va_id(prefix):
+    return f"{prefix}-" + "".join(random.choices("0123456789abcdef", k=17))
+
+
+def _va_bool(value):
+    return "true" if value else "false"
+
+
+def _va_text(tag, value):
+    if value is None or value == "":
+        return ""
+    return f"<{tag}>{_esc(str(value))}</{tag}>"
+
+
+def _va_struct(p, prefix, fields):
+    out = {}
+    for field in fields:
+        val = _p(p, f"{prefix}.{field}")
+        if val != "":
+            out[field] = val
+    return out
+
+
+def _va_sse_from(p, prefix="SseSpecification"):
+    enabled = _p(p, f"{prefix}.CustomerManagedKeyEnabled")
+    kms = _p(p, f"{prefix}.KmsKeyArn")
+    if enabled == "" and kms == "":
+        return None
+    return {"CustomerManagedKeyEnabled": enabled == "true", "KmsKeyArn": kms}
+
+
+def _va_sse_xml(sse):
+    if not sse:
+        return ""
+    return ("<sseSpecification>"
+            f"<customerManagedKeyEnabled>{_va_bool(sse.get('CustomerManagedKeyEnabled'))}</customerManagedKeyEnabled>"
+            f"{_va_text('kmsKeyArn', sse.get('KmsKeyArn'))}"
+            "</sseSpecification>")
+
+
+def _va_not_found(kind, resource_id):
+    return _error(f"InvalidVerifiedAccess{kind}Id.NotFound",
+                  f"The Verified Access {kind.lower().replace('trustprovider', 'trust provider')} "
+                  f"ID '{_esc(resource_id)}' does not exist", 400)
+
+
+def _va_missing(name):
+    return _error("MissingParameter",
+                  f"The request must contain the parameter {name}", 400)
+
+
+def _va_invalid(message):
+    return _error("InvalidParameterValue", message, 400)
+
+
+# ── Trust providers ────────────────────────────────────────
+
+
+def _va_trust_provider_condensed_xml(tp):
+    return ("<item>"
+            f"<verifiedAccessTrustProviderId>{tp['VerifiedAccessTrustProviderId']}</verifiedAccessTrustProviderId>"
+            f"{_va_text('description', tp.get('Description'))}"
+            f"<trustProviderType>{tp['TrustProviderType']}</trustProviderType>"
+            f"{_va_text('userTrustProviderType', tp.get('UserTrustProviderType'))}"
+            f"{_va_text('deviceTrustProviderType', tp.get('DeviceTrustProviderType'))}"
+            "</item>")
+
+
+def _va_oidc_xml(tag, oidc, fields=_VA_OIDC_FIELDS):
+    if not oidc:
+        return ""
+    inner = "".join(
+        _va_text(field[0].lower() + field[1:], oidc.get(field))
+        for field in fields if field != "ClientSecret"
+    )
+    return f"<{tag}>{inner}</{tag}>"
+
+
+def _va_trust_provider_xml(tp, tag="verifiedAccessTrustProvider"):
+    device = tp.get("DeviceOptions") or {}
+    device_xml = ""
+    if device:
+        device_xml = ("<deviceOptions>"
+                      f"{_va_text('tenantId', device.get('TenantId'))}"
+                      f"{_va_text('publicSigningKeyUrl', device.get('PublicSigningKeyUrl'))}"
+                      "</deviceOptions>")
+    return (f"<{tag}>"
+            f"<verifiedAccessTrustProviderId>{tp['VerifiedAccessTrustProviderId']}</verifiedAccessTrustProviderId>"
+            f"{_va_text('description', tp.get('Description'))}"
+            f"<trustProviderType>{tp['TrustProviderType']}</trustProviderType>"
+            f"{_va_text('userTrustProviderType', tp.get('UserTrustProviderType'))}"
+            f"{_va_text('deviceTrustProviderType', tp.get('DeviceTrustProviderType'))}"
+            f"{_va_oidc_xml('oidcOptions', tp.get('OidcOptions'))}"
+            f"{device_xml}"
+            f"{_va_oidc_xml('nativeApplicationOidcOptions', tp.get('NativeApplicationOidcOptions'), _VA_NATIVE_OIDC_FIELDS)}"
+            f"<policyReferenceName>{_esc(tp['PolicyReferenceName'])}</policyReferenceName>"
+            f"<creationTime>{tp['CreationTime']}</creationTime>"
+            f"<lastUpdatedTime>{tp['LastUpdatedTime']}</lastUpdatedTime>"
+            f"{_tag_set_xml(tp['VerifiedAccessTrustProviderId'])}"
+            f"{_va_sse_xml(tp.get('SseSpecification'))}"
+            f"</{tag}>")
+
+
+def _create_verified_access_trust_provider(p):
+    tp_type = _p(p, "TrustProviderType")
+    if not tp_type:
+        return _va_missing("TrustProviderType")
+    if tp_type not in _VA_TRUST_PROVIDER_TYPES:
+        return _va_invalid(f"Invalid TrustProviderType: {_esc(tp_type)}")
+    policy_ref = _p(p, "PolicyReferenceName")
+    if not policy_ref:
+        return _va_missing("PolicyReferenceName")
+    user_type = _p(p, "UserTrustProviderType")
+    device_type = _p(p, "DeviceTrustProviderType")
+    if tp_type == "user" and user_type not in _VA_USER_TRUST_PROVIDER_TYPES:
+        return _va_invalid("UserTrustProviderType must be iam-identity-center or oidc for a user trust provider")
+    if tp_type == "device" and device_type not in _VA_DEVICE_TRUST_PROVIDER_TYPES:
+        return _va_invalid("DeviceTrustProviderType must be jamf, crowdstrike or jumpcloud for a device trust provider")
+    now = _now_ts()
+    tp_id = _va_id("vatp")
+    record = {
+        "VerifiedAccessTrustProviderId": tp_id,
+        "Description": _p(p, "Description"),
+        "TrustProviderType": tp_type,
+        "UserTrustProviderType": user_type if tp_type == "user" else "",
+        "DeviceTrustProviderType": device_type if tp_type == "device" else "",
+        "OidcOptions": _va_struct(p, "OidcOptions", _VA_OIDC_FIELDS),
+        "NativeApplicationOidcOptions": _va_struct(
+            p, "NativeApplicationOidcOptions", _VA_NATIVE_OIDC_FIELDS),
+        "DeviceOptions": _va_struct(p, "DeviceOptions", ("TenantId", "PublicSigningKeyUrl")),
+        "PolicyReferenceName": policy_ref,
+        "CreationTime": now,
+        "LastUpdatedTime": now,
+        "SseSpecification": _va_sse_from(p),
+    }
+    _va_trust_providers[tp_id] = record
+    _parse_tag_specs(p, "verified-access-trust-provider", tp_id)
+    return _xml(200, "CreateVerifiedAccessTrustProviderResponse", _va_trust_provider_xml(record))
+
+
+def _describe_verified_access_trust_providers(p):
+    ids = _parse_member_list(p, "VerifiedAccessTrustProviderId")
+    for tp_id in ids:
+        if tp_id not in _va_trust_providers:
+            return _va_not_found("TrustProvider", tp_id)
+    items = "".join(
+        _va_trust_provider_xml(tp, tag="item")
+        for tp in _va_trust_providers.values()
+        if not ids or tp["VerifiedAccessTrustProviderId"] in ids
+    )
+    return _xml(200, "DescribeVerifiedAccessTrustProvidersResponse",
+                f"<verifiedAccessTrustProviderSet>{items}</verifiedAccessTrustProviderSet>")
+
+
+def _modify_verified_access_trust_provider(p):
+    tp_id = _p(p, "VerifiedAccessTrustProviderId")
+    tp = _va_trust_providers.get(tp_id)
+    if not tp:
+        return _va_not_found("TrustProvider", tp_id)
+    for key, fields in (("OidcOptions", _VA_OIDC_FIELDS),
+                        ("NativeApplicationOidcOptions", _VA_NATIVE_OIDC_FIELDS),
+                        ("DeviceOptions", ("PublicSigningKeyUrl",))):
+        update = _va_struct(p, key, fields)
+        if update:
+            tp[key] = {**(tp.get(key) or {}), **update}
+    if "Description" in p:
+        tp["Description"] = _p(p, "Description")
+    sse = _va_sse_from(p)
+    if sse is not None:
+        tp["SseSpecification"] = sse
+    tp["LastUpdatedTime"] = _now_ts()
+    return _xml(200, "ModifyVerifiedAccessTrustProviderResponse", _va_trust_provider_xml(tp))
+
+
+def _delete_verified_access_trust_provider(p):
+    tp_id = _p(p, "VerifiedAccessTrustProviderId")
+    tp = _va_trust_providers.get(tp_id)
+    if not tp:
+        return _va_not_found("TrustProvider", tp_id)
+    for inst in _va_instances.values():
+        if tp_id in inst["TrustProviderIds"]:
+            return _error("InvalidParameterValue",
+                          f"Verified Access trust provider {tp_id} is attached to "
+                          f"Verified Access instance {inst['VerifiedAccessInstanceId']}", 400)
+    body = _va_trust_provider_xml(tp)
+    _va_trust_providers.pop(tp_id, None)
+    _tags.pop(tp_id, None)
+    return _xml(200, "DeleteVerifiedAccessTrustProviderResponse", body)
+
+
+# ── Instances ──────────────────────────────────────────────
+
+
+def _va_instance_xml(inst, tag="verifiedAccessInstance"):
+    providers = "".join(
+        _va_trust_provider_condensed_xml(_va_trust_providers[tp_id])
+        for tp_id in inst["TrustProviderIds"] if tp_id in _va_trust_providers
+    )
+    return (f"<{tag}>"
+            f"<verifiedAccessInstanceId>{inst['VerifiedAccessInstanceId']}</verifiedAccessInstanceId>"
+            f"{_va_text('description', inst.get('Description'))}"
+            f"<verifiedAccessTrustProviderSet>{providers}</verifiedAccessTrustProviderSet>"
+            f"<creationTime>{inst['CreationTime']}</creationTime>"
+            f"<lastUpdatedTime>{inst['LastUpdatedTime']}</lastUpdatedTime>"
+            f"{_tag_set_xml(inst['VerifiedAccessInstanceId'])}"
+            f"<fipsEnabled>{_va_bool(inst.get('FipsEnabled'))}</fipsEnabled>"
+            f"</{tag}>")
+
+
+def _create_verified_access_instance(p):
+    now = _now_ts()
+    inst_id = _va_id("vai")
+    record = {
+        "VerifiedAccessInstanceId": inst_id,
+        "Description": _p(p, "Description"),
+        "TrustProviderIds": [],
+        "CreationTime": now,
+        "LastUpdatedTime": now,
+        "FipsEnabled": _p(p, "FIPSEnabled") == "true",
+        "AccessLogs": None,
+    }
+    _va_instances[inst_id] = record
+    _parse_tag_specs(p, "verified-access-instance", inst_id)
+    return _xml(200, "CreateVerifiedAccessInstanceResponse", _va_instance_xml(record))
+
+
+def _describe_verified_access_instances(p):
+    ids = _parse_member_list(p, "VerifiedAccessInstanceId")
+    for inst_id in ids:
+        if inst_id not in _va_instances:
+            return _va_not_found("Instance", inst_id)
+    items = "".join(
+        _va_instance_xml(inst, tag="item")
+        for inst in _va_instances.values()
+        if not ids or inst["VerifiedAccessInstanceId"] in ids
+    )
+    return _xml(200, "DescribeVerifiedAccessInstancesResponse",
+                f"<verifiedAccessInstanceSet>{items}</verifiedAccessInstanceSet>")
+
+
+def _modify_verified_access_instance(p):
+    inst_id = _p(p, "VerifiedAccessInstanceId")
+    inst = _va_instances.get(inst_id)
+    if not inst:
+        return _va_not_found("Instance", inst_id)
+    if "Description" in p:
+        inst["Description"] = _p(p, "Description")
+    inst["LastUpdatedTime"] = _now_ts()
+    return _xml(200, "ModifyVerifiedAccessInstanceResponse", _va_instance_xml(inst))
+
+
+def _delete_verified_access_instance(p):
+    inst_id = _p(p, "VerifiedAccessInstanceId")
+    inst = _va_instances.get(inst_id)
+    if not inst:
+        return _va_not_found("Instance", inst_id)
+    for group in _va_groups.values():
+        if group["VerifiedAccessInstanceId"] == inst_id:
+            return _error("InvalidParameterValue",
+                          f"Verified Access instance {inst_id} has Verified Access groups "
+                          f"({group['VerifiedAccessGroupId']}); delete them first", 400)
+    body = _va_instance_xml(inst)
+    _va_instances.pop(inst_id, None)
+    _tags.pop(inst_id, None)
+    return _xml(200, "DeleteVerifiedAccessInstanceResponse", body)
+
+
+def _va_attach_args(p):
+    inst_id = _p(p, "VerifiedAccessInstanceId")
+    tp_id = _p(p, "VerifiedAccessTrustProviderId")
+    inst = _va_instances.get(inst_id)
+    if not inst:
+        return None, None, _va_not_found("Instance", inst_id)
+    tp = _va_trust_providers.get(tp_id)
+    if not tp:
+        return None, None, _va_not_found("TrustProvider", tp_id)
+    return inst, tp, None
+
+
+def _attach_verified_access_trust_provider(p):
+    inst, tp, err = _va_attach_args(p)
+    if err:
+        return err
+    tp_id = tp["VerifiedAccessTrustProviderId"]
+    if tp_id not in inst["TrustProviderIds"]:
+        for other_id in inst["TrustProviderIds"]:
+            other = _va_trust_providers.get(other_id)
+            if other and other["TrustProviderType"] == tp["TrustProviderType"]:
+                return _va_invalid(
+                    f"Verified Access instance {inst['VerifiedAccessInstanceId']} already has a "
+                    f"{tp['TrustProviderType']} trust provider attached ({other_id})")
+        inst["TrustProviderIds"].append(tp_id)
+        inst["LastUpdatedTime"] = _now_ts()
+    return _xml(200, "AttachVerifiedAccessTrustProviderResponse",
+                _va_trust_provider_xml(tp) + _va_instance_xml(inst))
+
+
+def _detach_verified_access_trust_provider(p):
+    inst, tp, err = _va_attach_args(p)
+    if err:
+        return err
+    tp_id = tp["VerifiedAccessTrustProviderId"]
+    if tp_id not in inst["TrustProviderIds"]:
+        return _va_invalid(
+            f"Verified Access trust provider {tp_id} is not attached to "
+            f"Verified Access instance {inst['VerifiedAccessInstanceId']}")
+    inst["TrustProviderIds"].remove(tp_id)
+    inst["LastUpdatedTime"] = _now_ts()
+    return _xml(200, "DetachVerifiedAccessTrustProviderResponse",
+                _va_trust_provider_xml(tp) + _va_instance_xml(inst))
+
+
+# ── Instance logging configuration ─────────────────────────
+
+
+def _va_default_access_logs():
+    return {
+        "S3": {"Enabled": False},
+        "CloudWatchLogs": {"Enabled": False},
+        "KinesisDataFirehose": {"Enabled": False},
+        "LogVersion": _VA_DEFAULT_LOG_VERSION,
+        "IncludeTrustContext": False,
+    }
+
+
+def _va_log_destination_xml(tag, dest, fields):
+    enabled = bool(dest.get("Enabled"))
+    status = "success" if enabled else ""
+    status_xml = f"<deliveryStatus><code>{status}</code></deliveryStatus>" if status else ""
+    inner = "".join(_va_text(xml_name, dest.get(key)) for key, xml_name in fields)
+    return f"<{tag}><enabled>{_va_bool(enabled)}</enabled>{status_xml}{inner}</{tag}>"
+
+
+def _va_logging_xml(inst, tag="loggingConfiguration"):
+    logs = inst.get("AccessLogs") or _va_default_access_logs()
+    return (f"<{tag}>"
+            f"<verifiedAccessInstanceId>{inst['VerifiedAccessInstanceId']}</verifiedAccessInstanceId>"
+            "<accessLogs>"
+            + _va_log_destination_xml("s3", logs["S3"], (("BucketName", "bucketName"), ("Prefix", "prefix"),
+                                                          ("BucketOwner", "bucketOwner")))
+            + _va_log_destination_xml("cloudWatchLogs", logs["CloudWatchLogs"], (("LogGroup", "logGroup"),))
+            + _va_log_destination_xml("kinesisDataFirehose", logs["KinesisDataFirehose"],
+                                      (("DeliveryStream", "deliveryStream"),))
+            + f"<logVersion>{_esc(logs['LogVersion'])}</logVersion>"
+            f"<includeTrustContext>{_va_bool(logs['IncludeTrustContext'])}</includeTrustContext>"
+            "</accessLogs>"
+            f"</{tag}>")
+
+
+def _modify_verified_access_instance_logging_configuration(p):
+    inst_id = _p(p, "VerifiedAccessInstanceId")
+    inst = _va_instances.get(inst_id)
+    if not inst:
+        return _va_not_found("Instance", inst_id)
+    logs = copy.deepcopy(inst.get("AccessLogs") or _va_default_access_logs())
+    for key, fields in (("S3", ("BucketName", "Prefix", "BucketOwner")),
+                        ("CloudWatchLogs", ("LogGroup",)),
+                        ("KinesisDataFirehose", ("DeliveryStream",))):
+        enabled = _p(p, f"AccessLogs.{key}.Enabled")
+        if enabled == "":
+            continue
+        dest = {"Enabled": enabled == "true"}
+        if dest["Enabled"]:
+            dest.update(_va_struct(p, f"AccessLogs.{key}", fields))
+        logs[key] = dest
+    if _p(p, "AccessLogs.LogVersion"):
+        logs["LogVersion"] = _p(p, "AccessLogs.LogVersion")
+    if _p(p, "AccessLogs.IncludeTrustContext") != "":
+        logs["IncludeTrustContext"] = _p(p, "AccessLogs.IncludeTrustContext") == "true"
+    inst["AccessLogs"] = logs
+    return _xml(200, "ModifyVerifiedAccessInstanceLoggingConfigurationResponse", _va_logging_xml(inst))
+
+
+def _describe_verified_access_instance_logging_configurations(p):
+    ids = _parse_member_list(p, "VerifiedAccessInstanceId")
+    for inst_id in ids:
+        if inst_id not in _va_instances:
+            return _va_not_found("Instance", inst_id)
+    items = "".join(
+        _va_logging_xml(inst, tag="item")
+        for inst in _va_instances.values()
+        if not ids or inst["VerifiedAccessInstanceId"] in ids
+    )
+    return _xml(200, "DescribeVerifiedAccessInstanceLoggingConfigurationsResponse",
+                f"<loggingConfigurationSet>{items}</loggingConfigurationSet>")
+
+
+# ── Groups ─────────────────────────────────────────────────
+
+
+def _va_group_xml(group, tag="verifiedAccessGroup"):
+    return (f"<{tag}>"
+            f"<verifiedAccessGroupId>{group['VerifiedAccessGroupId']}</verifiedAccessGroupId>"
+            f"<verifiedAccessInstanceId>{group['VerifiedAccessInstanceId']}</verifiedAccessInstanceId>"
+            f"{_va_text('description', group.get('Description'))}"
+            f"<owner>{group['Owner']}</owner>"
+            f"<verifiedAccessGroupArn>{group['VerifiedAccessGroupArn']}</verifiedAccessGroupArn>"
+            f"<creationTime>{group['CreationTime']}</creationTime>"
+            f"<lastUpdatedTime>{group['LastUpdatedTime']}</lastUpdatedTime>"
+            f"{_tag_set_xml(group['VerifiedAccessGroupId'])}"
+            f"{_va_sse_xml(group.get('SseSpecification'))}"
+            f"</{tag}>")
+
+
+def _create_verified_access_group(p):
+    inst_id = _p(p, "VerifiedAccessInstanceId")
+    if not inst_id:
+        return _va_missing("VerifiedAccessInstanceId")
+    if inst_id not in _va_instances:
+        return _va_not_found("Instance", inst_id)
+    now = _now_ts()
+    group_id = _va_id("vagr")
+    policy = _p(p, "PolicyDocument")
+    record = {
+        "VerifiedAccessGroupId": group_id,
+        "VerifiedAccessInstanceId": inst_id,
+        "Description": _p(p, "Description"),
+        "Owner": get_account_id(),
+        "VerifiedAccessGroupArn": f"arn:aws:ec2:{get_region()}:{get_account_id()}:verified-access-group/{group_id}",
+        "CreationTime": now,
+        "LastUpdatedTime": now,
+        "SseSpecification": _va_sse_from(p),
+        "PolicyEnabled": bool(policy),
+        "PolicyDocument": policy,
+    }
+    _va_groups[group_id] = record
+    _parse_tag_specs(p, "verified-access-group", group_id)
+    return _xml(200, "CreateVerifiedAccessGroupResponse", _va_group_xml(record))
+
+
+def _describe_verified_access_groups(p):
+    ids = _parse_member_list(p, "VerifiedAccessGroupId")
+    inst_id = _p(p, "VerifiedAccessInstanceId")
+    for group_id in ids:
+        if group_id not in _va_groups:
+            return _va_not_found("Group", group_id)
+    items = "".join(
+        _va_group_xml(group, tag="item")
+        for group in _va_groups.values()
+        if (not ids or group["VerifiedAccessGroupId"] in ids)
+        and (not inst_id or group["VerifiedAccessInstanceId"] == inst_id)
+    )
+    return _xml(200, "DescribeVerifiedAccessGroupsResponse",
+                f"<verifiedAccessGroupSet>{items}</verifiedAccessGroupSet>")
+
+
+def _modify_verified_access_group(p):
+    group_id = _p(p, "VerifiedAccessGroupId")
+    group = _va_groups.get(group_id)
+    if not group:
+        return _va_not_found("Group", group_id)
+    new_inst = _p(p, "VerifiedAccessInstanceId")
+    if new_inst:
+        if new_inst not in _va_instances:
+            return _va_not_found("Instance", new_inst)
+        group["VerifiedAccessInstanceId"] = new_inst
+        for ep in _va_endpoints.values():
+            if ep["VerifiedAccessGroupId"] == group_id:
+                ep["VerifiedAccessInstanceId"] = new_inst
+    if "Description" in p:
+        group["Description"] = _p(p, "Description")
+    group["LastUpdatedTime"] = _now_ts()
+    return _xml(200, "ModifyVerifiedAccessGroupResponse", _va_group_xml(group))
+
+
+def _delete_verified_access_group(p):
+    group_id = _p(p, "VerifiedAccessGroupId")
+    group = _va_groups.get(group_id)
+    if not group:
+        return _va_not_found("Group", group_id)
+    for ep in _va_endpoints.values():
+        if ep["VerifiedAccessGroupId"] == group_id:
+            return _error("InvalidParameterValue",
+                          f"Verified Access group {group_id} has Verified Access endpoints "
+                          f"({ep['VerifiedAccessEndpointId']}); delete them first", 400)
+    group = dict(group, DeletionTime=_now_ts())
+    body = _va_group_xml(group)
+    _va_groups.pop(group_id, None)
+    _tags.pop(group_id, None)
+    return _xml(200, "DeleteVerifiedAccessGroupResponse", body)
+
+
+def _va_policy_xml(record, include_sse=False):
+    body = (f"<policyEnabled>{_va_bool(record.get('PolicyEnabled'))}</policyEnabled>"
+            f"{_va_text('policyDocument', record.get('PolicyDocument'))}")
+    if include_sse:
+        body += _va_sse_xml(record.get("SseSpecification"))
+    return body
+
+
+def _va_modify_policy(record, p):
+    enabled = _p(p, "PolicyEnabled")
+    if enabled == "":
+        return _va_missing("PolicyEnabled")
+    record["PolicyEnabled"] = enabled == "true"
+    if "PolicyDocument" in p:
+        record["PolicyDocument"] = _p(p, "PolicyDocument")
+    sse = _va_sse_from(p)
+    if sse is not None:
+        record["SseSpecification"] = sse
+    record["LastUpdatedTime"] = _now_ts()
+    return None
+
+
+def _get_verified_access_group_policy(p):
+    group_id = _p(p, "VerifiedAccessGroupId")
+    group = _va_groups.get(group_id)
+    if not group:
+        return _va_not_found("Group", group_id)
+    return _xml(200, "GetVerifiedAccessGroupPolicyResponse", _va_policy_xml(group))
+
+
+def _modify_verified_access_group_policy(p):
+    group_id = _p(p, "VerifiedAccessGroupId")
+    group = _va_groups.get(group_id)
+    if not group:
+        return _va_not_found("Group", group_id)
+    err = _va_modify_policy(group, p)
+    if err:
+        return err
+    return _xml(200, "ModifyVerifiedAccessGroupPolicyResponse", _va_policy_xml(group, include_sse=True))
+
+
+# ── Endpoints ──────────────────────────────────────────────
+
+
+def _va_member_items(values, tag):
+    return "".join(f"<item>{_esc(v)}</item>" for v in values) if values else ""
+
+
+def _va_parse_port_ranges(p, prefix):
+    ranges = []
+    i = 1
+    while _p(p, f"{prefix}.PortRange.{i}.FromPort") or _p(p, f"{prefix}.PortRange.{i}.ToPort"):
+        ranges.append({"FromPort": _p(p, f"{prefix}.PortRange.{i}.FromPort"),
+                       "ToPort": _p(p, f"{prefix}.PortRange.{i}.ToPort")})
+        i += 1
+    return ranges
+
+
+def _va_parse_target_options(p, prefix, with_arn_key):
+    opts = _va_struct(p, prefix, ("Protocol", "Port") + with_arn_key)
+    subnets = _parse_member_list(p, f"{prefix}.SubnetId")
+    if subnets:
+        opts["SubnetIds"] = subnets
+    ranges = _va_parse_port_ranges(p, prefix)
+    if ranges:
+        opts["PortRanges"] = ranges
+    return opts
+
+
+def _va_target_options_xml(tag, opts, arn_key, arn_tag):
+    if not opts:
+        return ""
+    ranges = "".join(
+        f"<item><fromPort>{r['FromPort']}</fromPort><toPort>{r['ToPort']}</toPort></item>"
+        for r in opts.get("PortRanges", [])
+    )
+    subnet_xml = (f"<subnetIdSet>{_va_member_items(opts.get('SubnetIds'), 'item')}</subnetIdSet>"
+                  if "SubnetIds" in opts else "")
+    return (f"<{tag}>"
+            f"{_va_text('protocol', opts.get('Protocol'))}"
+            f"{_va_text('port', opts.get('Port'))}"
+            f"{_va_text(arn_tag, opts.get(arn_key))}"
+            f"{subnet_xml}"
+            f"{'<portRangeSet>' + ranges + '</portRangeSet>' if ranges else ''}"
+            f"</{tag}>")
+
+
+def _va_endpoint_xml(ep, tag="verifiedAccessEndpoint"):
+    return (f"<{tag}>"
+            f"<verifiedAccessInstanceId>{ep['VerifiedAccessInstanceId']}</verifiedAccessInstanceId>"
+            f"<verifiedAccessGroupId>{ep['VerifiedAccessGroupId']}</verifiedAccessGroupId>"
+            f"<verifiedAccessEndpointId>{ep['VerifiedAccessEndpointId']}</verifiedAccessEndpointId>"
+            f"{_va_text('applicationDomain', ep.get('ApplicationDomain'))}"
+            f"<endpointType>{ep['EndpointType']}</endpointType>"
+            f"<attachmentType>{ep['AttachmentType']}</attachmentType>"
+            f"{_va_text('domainCertificateArn', ep.get('DomainCertificateArn'))}"
+            f"{_va_text('endpointDomain', ep.get('EndpointDomain'))}"
+            f"<securityGroupIdSet>{_va_member_items(ep.get('SecurityGroupIds'), 'item')}</securityGroupIdSet>"
+            f"{_va_target_options_xml('loadBalancerOptions', ep.get('LoadBalancerOptions'), 'LoadBalancerArn', 'loadBalancerArn')}"
+            f"{_va_target_options_xml('networkInterfaceOptions', ep.get('NetworkInterfaceOptions'), 'NetworkInterfaceId', 'networkInterfaceId')}"
+            f"<status><code>{ep['Status']}</code></status>"
+            f"{_va_text('description', ep.get('Description'))}"
+            f"<creationTime>{ep['CreationTime']}</creationTime>"
+            f"<lastUpdatedTime>{ep['LastUpdatedTime']}</lastUpdatedTime>"
+            f"{_va_text('deletionTime', ep.get('DeletionTime'))}"
+            f"{_tag_set_xml(ep['VerifiedAccessEndpointId'])}"
+            f"{_va_sse_xml(ep.get('SseSpecification'))}"
+            f"</{tag}>")
+
+
+def _create_verified_access_endpoint(p):
+    group_id = _p(p, "VerifiedAccessGroupId")
+    if not group_id:
+        return _va_missing("VerifiedAccessGroupId")
+    group = _va_groups.get(group_id)
+    if not group:
+        return _va_not_found("Group", group_id)
+    endpoint_type = _p(p, "EndpointType")
+    if endpoint_type not in _VA_ENDPOINT_TYPES:
+        return _va_invalid(f"Invalid EndpointType: {_esc(endpoint_type)}")
+    if endpoint_type in _VA_UNSUPPORTED_ENDPOINT_TYPES:
+        return _error("UnsupportedOperation",
+                      f"MiniStack does not emulate {endpoint_type} Verified Access endpoints", 400)
+    attachment_type = _p(p, "AttachmentType")
+    if attachment_type != "vpc":
+        return _va_invalid(f"Invalid AttachmentType: {_esc(attachment_type)}")
+    lb_opts = _va_parse_target_options(p, "LoadBalancerOptions", ("LoadBalancerArn",))
+    eni_opts = _va_parse_target_options(p, "NetworkInterfaceOptions", ("NetworkInterfaceId",))
+    if endpoint_type == "load-balancer" and not lb_opts.get("LoadBalancerArn"):
+        return _va_missing("LoadBalancerOptions.LoadBalancerArn")
+    if endpoint_type == "network-interface" and not eni_opts.get("NetworkInterfaceId"):
+        return _va_missing("NetworkInterfaceOptions.NetworkInterfaceId")
+    now = _now_ts()
+    ep_id = _va_id("vae")
+    prefix = _p(p, "EndpointDomainPrefix")
+    edge = "".join(random.choices("0123456789abcdef", k=17))
+    region = get_region()
+    endpoint_domain = (f"{prefix + '.' if prefix else ''}edge-{edge}."
+                       f"{group['VerifiedAccessInstanceId']}.prod.verified-access.{region}.amazonaws.com")
+    policy = _p(p, "PolicyDocument")
+    record = {
+        "VerifiedAccessInstanceId": group["VerifiedAccessInstanceId"],
+        "VerifiedAccessGroupId": group_id,
+        "VerifiedAccessEndpointId": ep_id,
+        "ApplicationDomain": _p(p, "ApplicationDomain"),
+        "EndpointType": endpoint_type,
+        "AttachmentType": attachment_type,
+        "DomainCertificateArn": _p(p, "DomainCertificateArn"),
+        "EndpointDomain": endpoint_domain,
+        "SecurityGroupIds": _parse_member_list(p, "SecurityGroupId"),
+        "LoadBalancerOptions": lb_opts if endpoint_type == "load-balancer" else None,
+        "NetworkInterfaceOptions": eni_opts if endpoint_type == "network-interface" else None,
+        # Endpoints come up immediately; the Terraform waiter accepts pending -> active.
+        "Status": "active",
+        "Description": _p(p, "Description"),
+        "CreationTime": now,
+        "LastUpdatedTime": now,
+        "SseSpecification": _va_sse_from(p),
+        "PolicyEnabled": bool(policy),
+        "PolicyDocument": policy,
+    }
+    _va_endpoints[ep_id] = record
+    _parse_tag_specs(p, "verified-access-endpoint", ep_id)
+    return _xml(200, "CreateVerifiedAccessEndpointResponse", _va_endpoint_xml(record))
+
+
+def _describe_verified_access_endpoints(p):
+    ids = _parse_member_list(p, "VerifiedAccessEndpointId")
+    group_id = _p(p, "VerifiedAccessGroupId")
+    inst_id = _p(p, "VerifiedAccessInstanceId")
+    for ep_id in ids:
+        if ep_id not in _va_endpoints:
+            return _va_not_found("Endpoint", ep_id)
+    items = "".join(
+        _va_endpoint_xml(ep, tag="item")
+        for ep in _va_endpoints.values()
+        if (not ids or ep["VerifiedAccessEndpointId"] in ids)
+        and (not group_id or ep["VerifiedAccessGroupId"] == group_id)
+        and (not inst_id or ep["VerifiedAccessInstanceId"] == inst_id)
+    )
+    return _xml(200, "DescribeVerifiedAccessEndpointsResponse",
+                f"<verifiedAccessEndpointSet>{items}</verifiedAccessEndpointSet>")
+
+
+def _modify_verified_access_endpoint(p):
+    ep_id = _p(p, "VerifiedAccessEndpointId")
+    ep = _va_endpoints.get(ep_id)
+    if not ep:
+        return _va_not_found("Endpoint", ep_id)
+    new_group = _p(p, "VerifiedAccessGroupId")
+    if new_group:
+        group = _va_groups.get(new_group)
+        if not group:
+            return _va_not_found("Group", new_group)
+        ep["VerifiedAccessGroupId"] = new_group
+        ep["VerifiedAccessInstanceId"] = group["VerifiedAccessInstanceId"]
+    for key, arn_key in (("LoadBalancerOptions", ("LoadBalancerArn",)),
+                         ("NetworkInterfaceOptions", ("NetworkInterfaceId",))):
+        update = _va_parse_target_options(p, key, arn_key)
+        if update and ep.get(key) is not None:
+            ep[key] = {**ep[key], **update}
+    if "Description" in p:
+        ep["Description"] = _p(p, "Description")
+    ep["LastUpdatedTime"] = _now_ts()
+    return _xml(200, "ModifyVerifiedAccessEndpointResponse", _va_endpoint_xml(ep))
+
+
+def _delete_verified_access_endpoint(p):
+    ep_id = _p(p, "VerifiedAccessEndpointId")
+    ep = _va_endpoints.get(ep_id)
+    if not ep:
+        return _va_not_found("Endpoint", ep_id)
+    # AWS answers with status deleting; the record is gone on the next read.
+    body = _va_endpoint_xml(dict(ep, Status="deleting"))
+    _va_endpoints.pop(ep_id, None)
+    _tags.pop(ep_id, None)
+    return _xml(200, "DeleteVerifiedAccessEndpointResponse", body)
+
+
+def _get_verified_access_endpoint_policy(p):
+    ep_id = _p(p, "VerifiedAccessEndpointId")
+    ep = _va_endpoints.get(ep_id)
+    if not ep:
+        return _va_not_found("Endpoint", ep_id)
+    return _xml(200, "GetVerifiedAccessEndpointPolicyResponse", _va_policy_xml(ep))
+
+
+def _modify_verified_access_endpoint_policy(p):
+    ep_id = _p(p, "VerifiedAccessEndpointId")
+    ep = _va_endpoints.get(ep_id)
+    if not ep:
+        return _va_not_found("Endpoint", ep_id)
+    err = _va_modify_policy(ep, p)
+    if err:
+        return err
+    return _xml(200, "ModifyVerifiedAccessEndpointPolicyResponse", _va_policy_xml(ep, include_sse=True))
+
+
+_VERIFIED_ACCESS_ACTIONS = {
+    "CreateVerifiedAccessInstance": _create_verified_access_instance,
+    "DescribeVerifiedAccessInstances": _describe_verified_access_instances,
+    "ModifyVerifiedAccessInstance": _modify_verified_access_instance,
+    "DeleteVerifiedAccessInstance": _delete_verified_access_instance,
+    "CreateVerifiedAccessTrustProvider": _create_verified_access_trust_provider,
+    "DescribeVerifiedAccessTrustProviders": _describe_verified_access_trust_providers,
+    "ModifyVerifiedAccessTrustProvider": _modify_verified_access_trust_provider,
+    "DeleteVerifiedAccessTrustProvider": _delete_verified_access_trust_provider,
+    "AttachVerifiedAccessTrustProvider": _attach_verified_access_trust_provider,
+    "DetachVerifiedAccessTrustProvider": _detach_verified_access_trust_provider,
+    "ModifyVerifiedAccessInstanceLoggingConfiguration": _modify_verified_access_instance_logging_configuration,
+    "DescribeVerifiedAccessInstanceLoggingConfigurations": _describe_verified_access_instance_logging_configurations,
+    "CreateVerifiedAccessGroup": _create_verified_access_group,
+    "DescribeVerifiedAccessGroups": _describe_verified_access_groups,
+    "ModifyVerifiedAccessGroup": _modify_verified_access_group,
+    "DeleteVerifiedAccessGroup": _delete_verified_access_group,
+    "GetVerifiedAccessGroupPolicy": _get_verified_access_group_policy,
+    "ModifyVerifiedAccessGroupPolicy": _modify_verified_access_group_policy,
+    "CreateVerifiedAccessEndpoint": _create_verified_access_endpoint,
+    "DescribeVerifiedAccessEndpoints": _describe_verified_access_endpoints,
+    "ModifyVerifiedAccessEndpoint": _modify_verified_access_endpoint,
+    "DeleteVerifiedAccessEndpoint": _delete_verified_access_endpoint,
+    "GetVerifiedAccessEndpointPolicy": _get_verified_access_endpoint_policy,
+    "ModifyVerifiedAccessEndpointPolicy": _modify_verified_access_endpoint_policy,
+}
+
+
 _ACTION_MAP = {
     "RunInstances": _run_instances,
 
@@ -7400,3 +8194,4 @@ _ACTION_MAP = {
     "CreateFleet": _create_fleet,
     "DescribeFleets": _describe_fleets,
 }
+_ACTION_MAP.update(_VERIFIED_ACCESS_ACTIONS)
