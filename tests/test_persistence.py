@@ -639,6 +639,36 @@ def test_backup_round_trip():
     _round_trip("backup", "backup", populate, observe)
 
 
+def test_route53_private_zone_vpcs_round_trip():
+    vpc = {"VPCRegion": "us-west-2", "VPCId": "vpc-0123456789abcdef0"}
+    body = (
+        '<CreateHostedZoneRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">'
+        "<Name>persisted.example.internal</Name><CallerReference>persist-1</CallerReference>"
+        f"<VPC><VPCRegion>{vpc['VPCRegion']}</VPCRegion><VPCId>{vpc['VPCId']}</VPCId></VPC>"
+        "</CreateHostedZoneRequest>"
+    ).encode()
+    zone_ids = []
+
+    def populate(mod):
+        status, _, _ = mod._create_hosted_zone(body, {})
+        assert status == 201
+        zone_ids.extend(mod._zones.keys())
+        # A zone persisted before VPC associations existed has no "vpcs" key.
+        mod._zones["ZLEGACYPRIVATE1"] = {
+            "id": "ZLEGACYPRIVATE1", "name": "legacy.example.internal.",
+            "caller_reference": "legacy", "comment": "", "private": True,
+        }
+
+    def observe(mod):
+        assert mod._zones[zone_ids[0]]["vpcs"] == [vpc]
+        status, _, out = mod._list_hosted_zones_by_vpc({"vpcid": vpc["VPCId"], "vpcregion": vpc["VPCRegion"]})
+        assert status == 200 and zone_ids[0].encode() in out
+        status, _, out = mod._get_hosted_zone("ZLEGACYPRIVATE1")
+        assert status == 200 and b"<VPCs />" in out
+
+    _round_trip("route53", "route53", populate, observe)
+
+
 def test_s3_mrap_round_trip():
     """A multi-region access point outlives a restart. Its alias is baked into
     client configuration, so member buckets coming back without the alias

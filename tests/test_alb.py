@@ -1930,3 +1930,143 @@ def test_alb_http_header_condition_round_trips_and_matches(elbv2):
     finally:
         elbv2.delete_listener(ListenerArn=l_arn)
         elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+
+_TLS_CERT = "arn:aws:acm:us-east-1:000000000000:certificate/tls-default"
+_TLS_CERT_2 = "arn:aws:acm:us-east-1:000000000000:certificate/tls-second"
+_TLS_ACTION = [{"Type": "fixed-response",
+                "FixedResponseConfig": {"StatusCode": "404", "ContentType": "text/plain"}}]
+
+
+@pytest.fixture
+def tls_lb(elbv2):
+    """A load balancer whose listeners and itself are removed after the test."""
+    created = []
+
+    def make(lb_type="application"):
+        name = f"tls-{_uuid_mod.uuid4().hex[:12]}"
+        lb = elbv2.create_load_balancer(Name=name, Type=lb_type)["LoadBalancers"][0]
+        created.append(lb["LoadBalancerArn"])
+        return lb["LoadBalancerArn"]
+
+    yield make
+    for lb_arn in created:
+        for listener in elbv2.describe_listeners(LoadBalancerArn=lb_arn)["Listeners"]:
+            elbv2.delete_listener(ListenerArn=listener["ListenerArn"])
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+def test_elbv2_https_listener_returns_ssl_policy_and_certificate(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    created = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+        SslPolicy="ELBSecurityPolicy-TLS13-1-2-2021-06",
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]
+    assert created["SslPolicy"] == "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    assert created["Certificates"] == [{"CertificateArn": _TLS_CERT}]
+
+    described = elbv2.describe_listeners(ListenerArns=[created["ListenerArn"]])["Listeners"][0]
+    assert described["SslPolicy"] == "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    assert described["Certificates"] == [{"CertificateArn": _TLS_CERT}]
+
+
+def test_elbv2_https_listener_defaults_ssl_policy(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    created = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]
+    assert created["SslPolicy"] == "ELBSecurityPolicy-2016-08"
+    described = elbv2.describe_listeners(ListenerArns=[created["ListenerArn"]])["Listeners"][0]
+    assert described["SslPolicy"] == "ELBSecurityPolicy-2016-08"
+
+
+def test_elbv2_tls_listener_on_network_lb_keeps_tls_settings(elbv2, tls_lb):
+    lb_arn = tls_lb("network")
+    created = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="TLS", Port=443,
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]
+    described = elbv2.describe_listeners(ListenerArns=[created["ListenerArn"]])["Listeners"][0]
+    assert described["SslPolicy"] == "ELBSecurityPolicy-2016-08"
+    assert described["Certificates"] == [{"CertificateArn": _TLS_CERT}]
+
+
+def test_elbv2_modify_listener_updates_ssl_policy_and_certificate(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]["ListenerArn"]
+
+    modified = elbv2.modify_listener(
+        ListenerArn=l_arn, SslPolicy="ELBSecurityPolicy-TLS13-1-2-2021-06",
+        Certificates=[{"CertificateArn": _TLS_CERT_2}],
+    )["Listeners"][0]
+    assert modified["SslPolicy"] == "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    assert modified["Certificates"] == [{"CertificateArn": _TLS_CERT_2}]
+
+    # A modify that names neither keeps both.
+    elbv2.modify_listener(ListenerArn=l_arn, Port=8443)
+    described = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+    assert described["SslPolicy"] == "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    assert described["Certificates"] == [{"CertificateArn": _TLS_CERT_2}]
+
+
+def test_elbv2_modify_listener_to_http_drops_tls_settings(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+        SslPolicy="ELBSecurityPolicy-TLS13-1-2-2021-06",
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]["ListenerArn"]
+
+    elbv2.modify_listener(ListenerArn=l_arn, Protocol="HTTP", Port=80)
+    described = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+    assert described["Protocol"] == "HTTP"
+    assert "SslPolicy" not in described
+    assert "Certificates" not in described
+
+    # Back to HTTPS: nothing stale returns, the policy is the default again.
+    elbv2.modify_listener(ListenerArn=l_arn, Protocol="HTTPS", Port=443,
+                          Certificates=[{"CertificateArn": _TLS_CERT_2}])
+    described = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+    assert described["SslPolicy"] == "ELBSecurityPolicy-2016-08"
+    assert described["Certificates"] == [{"CertificateArn": _TLS_CERT_2}]
+
+
+def test_elbv2_http_listener_keeps_no_tls_settings(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    created = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80,
+        SslPolicy="ELBSecurityPolicy-TLS13-1-2-2021-06",
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]
+    assert "SslPolicy" not in created
+    assert "Certificates" not in created
+    described = elbv2.describe_listeners(ListenerArns=[created["ListenerArn"]])["Listeners"][0]
+    assert "SslPolicy" not in described
+    assert "Certificates" not in described
+
+
+def test_elbv2_listener_rejects_more_than_one_default_certificate(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    two = [{"CertificateArn": _TLS_CERT}, {"CertificateArn": _TLS_CERT_2}]
+    with pytest.raises(ClientError) as exc:
+        elbv2.create_listener(LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+                              Certificates=two, DefaultActions=_TLS_ACTION)
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert elbv2.describe_listeners(LoadBalancerArn=lb_arn)["Listeners"] == []
+
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]["ListenerArn"]
+    with pytest.raises(ClientError) as exc:
+        elbv2.modify_listener(ListenerArn=l_arn, Port=8443, Certificates=two)
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    described = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+    assert described["Port"] == 443
+    assert described["Certificates"] == [{"CertificateArn": _TLS_CERT}]

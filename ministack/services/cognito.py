@@ -882,6 +882,10 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
                     except (TypeError, ValueError):
                         claims[k] = v
                     continue
+                if k in ("email_verified", "phone_number_verified"):
+                    # AWS carries the standard verified flags as JSON booleans in the ID token
+                    claims[k] = v == "true"
+                    continue
                 claims[k] = v
             if "email" in user_attrs:
                 claims.setdefault("email_verified", True)
@@ -3773,6 +3777,10 @@ def _admin_delete_user(data):
     # can pass an alias (email), which is not the "_users" key.
     del pool["_users"][user["Username"]]
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+    # A deleted user's refresh tokens end with it: a new user of the same name inherits none of them.
+    for token in [t for t, e in _refresh_tokens.items()
+                  if e.get("username") == user["Username"] and e.get("pool_id") == pid]:
+        del _refresh_tokens[token]
     return json_response({})
 
 
@@ -4477,6 +4485,9 @@ def _refresh_auth_user(pool, pid, cid, refresh_token):
     if (not isinstance(claims, dict) or claims.get("token_use") != "refresh"
             or str(claims.get("iss", "")).rsplit("/", 1)[-1] != pid):
         return None, error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
+    from ministack.app import AUTH
+    if AUTH and _RSA_PRIVATE_KEY is not None and not _signature_valid(refresh_token):
+        return None, error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
     if claims.get("client_id") != cid:
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has different Client", 400)
@@ -4484,10 +4495,10 @@ def _refresh_auth_user(pool, pid, cid, refresh_token):
     if not user:
         return None, error_response_json("NotAuthorizedException",
                                          "The user has been deleted for the associated refresh token", 400)
-    from ministack.app import AUTH
     if AUTH and not user.get("Enabled", True):
         return None, error_response_json("NotAuthorizedException", "User is disabled.", 400)
-    if _refresh_token_revoked(refresh_token, user) or (AUTH and claims.get("origin_jti") in _revoked_tokens):
+    origin = claims.get("origin_jti")
+    if _refresh_token_revoked(refresh_token, user) or (AUTH and isinstance(origin, str) and origin in _revoked_tokens):
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has been revoked", 400)
     return user, None
@@ -7197,6 +7208,10 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             user = pool["_users"].get(entry["username"])
             if not user:
                 return _oauth2_error("server_error", "User not found.")
+            from ministack.app import AUTH
+            if AUTH and not user.get("Enabled", True):
+                # A code issued before AdminDisableUser no longer signs the user in.
+                return _oauth2_error("invalid_grant", "User is disabled.")
 
             scope = _granted_scopes(client, entry.get("scope"))
             result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""),
@@ -7283,6 +7298,11 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         user = pool["_users"].get(entry["username"])
         if not user:
             return _oauth2_error("server_error", "User not found.")
+        from ministack.app import AUTH
+        registry_origin = _token_claims(refresh_val).get("origin_jti")
+        if AUTH and (not user.get("Enabled", True) or _refresh_token_revoked(refresh_val, user) or (
+                isinstance(registry_origin, str) and registry_origin in _revoked_tokens)):
+            return _oauth2_error("invalid_grant", "Invalid refresh token.")
 
         # Validate client secret if client has one
         _, _, client = _find_pool_by_client_id(cid or entry["client_id"])
@@ -7406,7 +7426,10 @@ def handle_oauth2_userinfo(method, path, headers, body, query_params):
     error = _userinfo_token_error(token) if AUTH else None
     if error:
         iss = _token_claims(token).get("iss")
-        realm = f"realm={iss}, " if isinstance(iss, str) and _get_pool_unscoped(iss.rsplit("/", 1)[-1]) else ""
+        pool_id = iss.rsplit("/", 1)[-1] if isinstance(iss, str) else ""
+        # The pool's own issuer, never the text a token claims.
+        realm = (f"realm=https://cognito-idp.{pool_id.split('_', 1)[0]}.amazonaws.com/{pool_id}, "
+                 if pool_id and _get_pool_unscoped(pool_id) else "")
         return 401, {"Content-Type": "application/json", "WWW-Authenticate": f"Bearer {realm}error=INVALID_TOKEN"}, \
             json.dumps({"error": "invalid_token", "error_description": error}).encode()
     # Decode JWT payload
@@ -7591,14 +7614,14 @@ def _get_id(data):
     pool = _identity_pools.get(iid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
+    logins = data.get("Logins") or {}
     if AUTH:
-        logins = data.get("Logins") or {}
         error = _identity_logins_error(pool, None, logins)
         if error:
             return error
-        owner = _link_logins(pool, None, logins)
-        if owner:
-            return json_response({"IdentityId": owner})
+    owner = _link_logins(pool, None, logins)
+    if owner:
+        return json_response({"IdentityId": owner})
     identity_id = _identity_id(iid)
     pool["_identities"][identity_id] = {
         "IdentityId": identity_id,
@@ -7657,7 +7680,7 @@ def _get_credentials_for_identity(data):
                 error = _identity_logins_error(candidate, identity_id, logins)
                 if error:
                     return error
-                identity_id = _link_logins(candidate, identity_id, logins)
+            identity_id = _link_logins(candidate, identity_id, logins)
             if not logins:
                 logins = candidate["_identities"][identity_id].get("Logins") or {}
             break
@@ -7718,9 +7741,15 @@ def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
             return None
         return error_response_json("NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.", 400)
     unsupported = "Token is not from a supported provider of this identity pool."
-    not_oidc = "Invalid login token. Not a valid OpenId Connect identity token."
     mismatch = "Logins don't match. Please include at least one valid login for this identity or identity pool."
+    if not isinstance(logins, dict):
+        return error_response_json("NotAuthorizedException", unsupported, 400)
+    not_oidc = "Invalid login token. Not a valid OpenId Connect identity token."
     skewed_now = int(time.time()) - _LOGIN_TOKEN_CLOCK_SKEW
+    supported = set(pool.get("SupportedLoginProviders") or {}) | set(pool.get("SamlProviderARNs") or [])
+    supported |= {arn.split("oidc-provider/", 1)[-1] for arn in pool.get("OpenIdConnectProviderARNs") or []}
+    if pool.get("DeveloperProviderName"):
+        supported.add("cognito-identity.amazonaws.com")
     for provider, token in logins.items():
         clients = [p.get("ClientId") for p in pool.get("CognitoIdentityProviders") or []
                    if p.get("ProviderName") == provider]
@@ -7728,9 +7757,15 @@ def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
         is_jwt = isinstance(token, str) and token.count(".") == 2 and bool(claims)
         if provider == "accounts.google.com" and not is_jwt and provider in (pool.get("SupportedLoginProviders") or {}):
             message = not_oidc
+        elif not provider.startswith("cognito-idp.") and provider not in supported:
+            message = unsupported
         elif not provider.startswith("cognito-idp."):
-            # Other providers' tokens are opaque here.
-            continue
+            # A supported provider's token is opaque here; an identity's own login must still be the one it holds.
+            if provider in stored and token != stored[provider] and (
+                    not claims.get("sub") or _token_claims(stored[provider]).get("sub") != claims.get("sub")):
+                message = mismatch
+            else:
+                continue
         elif not clients:
             message = unsupported
         elif not is_jwt:
@@ -7751,19 +7786,23 @@ def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
             continue
         return error_response_json("NotAuthorizedException", message, 400)
     # An identity with a login needs one of its own; a disabled one, a login another identity holds.
-    none_of_its_own = stored and not stored.keys() & logins.keys()
-    if none_of_its_own or identity.get("_merged_into") and not _login_owner(pool, logins):
+    if stored and not any(provider in stored for provider in logins) or (
+            identity.get("_merged_into") and not _login_owner(pool, logins)):
         return error_response_json("NotAuthorizedException", mismatch, 400)
     return None
 
 
 def _login_owner(pool: dict, logins: dict):
     """The id of the pool's identity that already holds one of these logins, or None."""
+    if not isinstance(logins, dict):
+        return None
     for provider, token in logins.items():
         sub = _token_claims(token).get("sub")
         for identity_id, identity in pool["_identities"].items():
             held = (identity.get("Logins") or {}).get(provider)
-            if held is not None and (held == token or (sub and _token_claims(held).get("sub") == sub)):
+            # Only a user pool token is verified, so only its sub identifies a user.
+            if held is not None and (held == token or (
+                    sub and provider.startswith("cognito-idp.") and _token_claims(held).get("sub") == sub)):
                 return identity_id
     return None
 
@@ -7815,7 +7854,7 @@ def _get_open_id_token(data):
                 error = _identity_logins_error(pool, identity_id, logins)
                 if error:
                     return error
-                identity_id = _link_logins(pool, identity_id, logins)
+            identity_id = _link_logins(pool, identity_id, logins)
             logins = logins or pool["_identities"][identity_id].get("Logins") or {}
             break
     if not pool_id:
