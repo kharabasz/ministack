@@ -747,7 +747,13 @@ def test_cloudwatch_put_composite_alarm_validates_rule(cw):
                 cw.put_composite_alarm(AlarmName=f"{p}bad", AlarmRule=rule)
             assert exc.value.response["Error"]["Code"] == "ValidationError"
             assert exc.value.response["Error"]["Message"] == message
+        with pytest.raises(ClientError) as exc:
+            cw.put_composite_alarm(AlarmName=f"{p}bad", AlarmRule="(" * 2000 + "TRUE" + ")" * 2000)
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
         assert cw.describe_alarms(AlarmNames=[f"{p}bad"], AlarmTypes=["CompositeAlarm"])["CompositeAlarms"] == []
+        # A long flat chain within the 10240-character limit is not nesting.
+        cw.put_composite_alarm(AlarmName=f"{p}chain", AlarmRule=" AND ".join(["TRUE"] * 1100))
+        cw.delete_alarms(AlarmNames=[f"{p}chain"])
     finally:
         cw.delete_alarms(AlarmNames=[a])
 

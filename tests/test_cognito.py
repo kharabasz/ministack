@@ -1519,9 +1519,8 @@ def test_cognito_get_id_checks_logins(auth_enabled, cognito_idp, cognito_identit
     ]:
         result = ctx.call("get_id", IdentityPoolId=ctx.pool, Logins=logins)
         assert result == ("NotAuthorizedException", message) if auth_enabled else "IdentityId" in result
-    # With AUTH a login that has an identity gets that identity back; without it every GetId makes a new one.
-    found = ctx.call("get_id", IdentityPoolId=ctx.pool, Logins={provider: tokens["u1"]})["IdentityId"]
-    assert (found == ctx.u1) == auth_enabled
+    # A login that has an identity gets that identity back.
+    assert ctx.call("get_id", IdentityPoolId=ctx.pool, Logins={provider: tokens["u1"]})["IdentityId"] == ctx.u1
 
 
 @pytest.mark.auth_contract
@@ -1534,12 +1533,11 @@ def test_cognito_identity_without_login_takes_one(auth_enabled, cognito_idp, cog
         logins = ctx.call("describe_identity", IdentityId=identity_id).get("Logins", [])
         found = ctx.call("get_id", IdentityPoolId=ctx.pool, Logins={provider: tokens[user]})["IdentityId"]
         without_logins = ctx.call("get_credentials_for_identity", IdentityId=identity_id)
+        assert (logins, found) == ([provider], identity_id)
         if auth_enabled:
-            assert (logins, found) == ([provider], identity_id)
             assert without_logins == ("NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.")
         else:
-            assert (logins, without_logins["IdentityId"]) == ([], identity_id)
-            assert found != identity_id
+            assert without_logins["IdentityId"] == identity_id
 
 
 @pytest.mark.auth_contract
@@ -1552,18 +1550,16 @@ def test_cognito_identity_without_login_merges_into_the_logins_identity(auth_ena
         identity_id = ctx.call("get_id", IdentityPoolId=ctx.pool)["IdentityId"]
         result = ctx.call(action, IdentityId=identity_id, Logins={provider: tokens[user]})
         logins = ctx.call("describe_identity", IdentityId=identity_id)["Logins"]
-        if not auth_enabled:
-            assert (result["IdentityId"], logins) == (identity_id, [])
-            continue
         # The call answers for the identity that holds the login and disables the caller's.
         assert (result["IdentityId"], logins) == (holder, ["DISABLED", "us-east-1"])
         if action == "get_open_id_token":
             assert _decode_jwt_claims(result["Token"])["sub"] == holder
         assert ctx.call(action, IdentityId=identity_id, Logins={provider: tokens[user]})["IdentityId"] == holder
-        assert ctx.call(action, IdentityId=identity_id) == (
-            "NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.")
-        assert ctx.call(action, IdentityId=identity_id, Logins={provider: tokens["u2"]}) == (
-            "NotAuthorizedException", mismatch)
+        if auth_enabled:
+            assert ctx.call(action, IdentityId=identity_id) == (
+                "NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.")
+            assert ctx.call(action, IdentityId=identity_id, Logins={provider: tokens["u2"]}) == (
+                "NotAuthorizedException", mismatch)
         listed = {hide: [i["IdentityId"] for i in ctx.call(
             "list_identities", IdentityPoolId=ctx.pool, MaxResults=60, HideDisabled=hide)["Identities"]]
             for hide in (False, True)}
@@ -1593,20 +1589,18 @@ def test_cognito_identity_merges_the_identities_holding_its_logins(auth_enabled,
     only_new_login = ctx.call("get_credentials_for_identity", IdentityId=u3, Logins={provider_b: tokens["b5"]})
     u5, b6 = get_id({provider: tokens["u5"]}), get_id({provider_b: tokens["b6"]})
     both_held = get_id({provider: tokens["u5"], provider_b: tokens["b6"]})
-    if not auth_enabled:
-        assert (logins_of(ctx.u1), logins_of(held_b)) == ([provider], [provider_b])
-        assert only_new_login["IdentityId"] == u3
-        assert both_held not in (u5, b6)
-        return
     # The caller keeps its identity, takes the other identity's logins and disables it.
     assert (logins_of(ctx.u1), logins_of(held_b)) == (sorted([provider, provider_b]), ["DISABLED", "us-east-1"])
     assert get_id({provider_b: tokens["b"]}) == ctx.u1
     assert ctx.call("get_credentials_for_identity", IdentityId=held_b,
                     Logins={provider_b: tokens["b"]})["IdentityId"] == ctx.u1
-    # An identity with a login needs one of its own; a new login next to it is linked.
-    assert only_new_login == (
-        "NotAuthorizedException",
-        "Logins don't match. Please include at least one valid login for this identity or identity pool.")
+    # Under AUTH an identity with a login needs one of its own; a new login next to it is linked.
+    if auth_enabled:
+        assert only_new_login == (
+            "NotAuthorizedException",
+            "Logins don't match. Please include at least one valid login for this identity or identity pool.")
+    else:
+        assert only_new_login["IdentityId"] == u3
     result = ctx.call("get_credentials_for_identity", IdentityId=u3,
                       Logins={provider: tokens["u3"], provider_b: tokens["b5"]})
     assert (result["IdentityId"], logins_of(u3)) == (u3, sorted([provider, provider_b]))
@@ -6706,6 +6700,33 @@ def test_cognito_username_attributes_admin_create_user_username_is_sub(cognito_i
     assert _decode_jwt_claims(tokens["IdToken"])["cognito:username"] == sub
     assert _decode_jwt_claims(tokens["AccessToken"])["username"] == sub
     assert cognito_idp.get_user(AccessToken=tokens["AccessToken"])["Username"] == sub
+
+
+def test_cognito_id_token_verified_flags_are_booleans(cognito_idp):
+    """email_verified and phone_number_verified are JSON booleans in the ID token, as on AWS (#2294)."""
+    pid = cognito_idp.create_user_pool(PoolName="IdTokenVerifiedFlagsPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="app", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="verified", MessageAction="SUPPRESS",
+        UserAttributes=[
+            {"Name": "email", "Value": "verified@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+            {"Name": "phone_number", "Value": "+15555550100"},
+            {"Name": "phone_number_verified", "Value": "false"},
+        ],
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="verified", Password="StrongPass1!", Permanent=True,
+    )
+    tokens = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "verified", "PASSWORD": "StrongPass1!"},
+    )["AuthenticationResult"]
+    claims = _decode_jwt_claims(tokens["IdToken"])
+    assert claims["email_verified"] is True
+    assert claims["phone_number_verified"] is False
 
 
 def test_cognito_username_attributes_sign_up_username_is_sub(cognito_idp):
@@ -12011,3 +12032,32 @@ def test_cognito_inbound_federation_trigger_unconfigured_pool_keeps_idp_attribut
     user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_plain-name-id")
     attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
     assert attrs["email"] == "raw@example.com"
+
+
+@pytest.mark.auth_contract
+def test_cognito_unsupported_login_and_forged_refresh_token_contract(auth_enabled, cognito_idp, cognito_identity):
+    """A linked identity answers to no unsupported provider, and a refresh token's signature is checked."""
+    ctx = _identity_logins(cognito_idp, cognito_identity)
+    result = ctx.call("get_credentials_for_identity", IdentityId=ctx.u1, Logins={"made.up": "x"})
+    if auth_enabled:
+        assert result == ("NotAuthorizedException", "Token is not from a supported provider of this identity pool.")
+    else:
+        assert result["IdentityId"] == ctx.u1
+
+    pid = cognito_idp.create_user_pool(PoolName="ForgedRefresh")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="app", ExplicitAuthFlows=[
+        "ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"])["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="victim", MessageAction="SUPPRESS")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="victim", Password="Passw0rd!", Permanent=True)
+    refresh = cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={
+        "USERNAME": "victim", "PASSWORD": "Passw0rd!"})["AuthenticationResult"]["RefreshToken"]
+    header, payload, _signature = refresh.split(".")
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=="))
+    forged_payload = base64.urlsafe_b64encode(json.dumps({**claims, "origin_jti": "forged"}).encode()).decode().rstrip("=")
+    forged = f"{header}.{forged_payload}.AAAA"
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH", AuthParameters={"REFRESH_TOKEN": forged})
+        assert exc.value.response["Error"]["Message"] == "Invalid Refresh Token"
+    assert cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH", AuthParameters={
+        "REFRESH_TOKEN": refresh})["AuthenticationResult"]["AccessToken"]
