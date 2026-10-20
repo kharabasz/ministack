@@ -1439,6 +1439,35 @@ def test_s3_public_access_block(s3):
     assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
 
 
+def test_s3_block_public_policy_refuses_a_public_bucket_policy(s3):
+    bkt = f"intg-s3-bpp-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+
+    def policy(**extra):
+        return json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:::{bkt}/*", **extra}]})
+
+    try:
+        s3.put_bucket_policy(Bucket=bkt, Policy=policy())
+        s3.put_public_access_block(Bucket=bkt, PublicAccessBlockConfiguration={
+            "BlockPublicAcls": False, "IgnorePublicAcls": False,
+            "BlockPublicPolicy": True, "RestrictPublicBuckets": False})
+        # The policy set before the setting stays.
+        assert json.loads(s3.get_bucket_policy(Bucket=bkt)["Policy"]) == json.loads(policy())
+        for public in (policy(), policy(Condition={"StringLike": {"aws:SourceVpc": "vpc-*"}})):
+            with pytest.raises(ClientError) as exc:
+                s3.put_bucket_policy(Bucket=bkt, Policy=public)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        s3.put_bucket_policy(Bucket=bkt, Policy=policy(
+            Condition={"StringEquals": {"aws:SourceVpc": "vpc-91237329"}}))
+    finally:
+        s3.delete_public_access_block(Bucket=bkt)
+        s3.delete_bucket_policy(Bucket=bkt)
+        s3.delete_bucket(Bucket=bkt)
+
+
 def test_s3_block_public_acls_refuses_setting_a_public_acl(s3):
     """BlockPublicAcls refuses every call that sets a public ACL; private grants and IgnorePublicAcls alone pass."""
     import requests
@@ -9420,6 +9449,18 @@ def test_s3_canned_acl_condition_contract(auth_enabled, iam_user, auth_condition
 
 
 @pytest.mark.auth_contract
+def test_s3_grant_header_condition_contract(auth_enabled, iam_user, auth_condition_bucket):
+    """A bucket policy on s3:x-amz-grant-read sees the grant header of a PutObject."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"Null": {"s3:x-amz-grant-read": "false"}})
+    client = user.client("s3")
+    _assert_s3_condition(auth_enabled, True, lambda: client.put_object(Bucket=bucket, Key="plain", Body=b"x"))
+    grant = 'id="c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0"'
+    _assert_s3_condition(auth_enabled, False,
+                         lambda: client.put_object(Bucket=bucket, Key="granted", Body=b"x", GrantRead=grant))
+
+
+@pytest.mark.auth_contract
 def test_s3_existing_object_tag_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket):
     """A bucket policy on s3:ExistingObjectTag sees the tags of the object a GetObject or HeadObject reads."""
     user = iam_user(policy=_ALLOW_ALL_S3)
@@ -9928,3 +9969,57 @@ def test_s3_bucket_config_enum_and_day_validation(s3):
     s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
         {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms:dsse"}}]})
     s3.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
+def test_s3_anonymous_copy_source_and_policy_action_contract(auth_enabled, s3):
+    """A public PutObject policy lets anonymous callers write, not read another bucket through a copy or delete."""
+    secret, upload = f"anon-src-{uuid.uuid4().hex[:8]}", f"anon-dst-{uuid.uuid4().hex[:8]}"
+    for bucket in (secret, upload):
+        s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=secret, Key="c", Body=b"secret")
+    s3.put_object(Bucket=upload, Key="kept", Body=b"kept")
+    s3.put_bucket_policy(Bucket=upload, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{upload}/*"}]}))
+    try:
+        assert requests.put(f"{ENDPOINT}/{upload}/plain", data=b"x").status_code == 200
+        copy = requests.put(f"{ENDPOINT}/{upload}/loot", headers={"x-amz-copy-source": f"/{secret}/c"})
+        delete = requests.delete(f"{ENDPOINT}/{upload}/kept")
+        if auth_enabled:
+            assert (copy.status_code, delete.status_code) == (403, 403)
+        else:
+            assert (copy.status_code, delete.status_code) == (200, 204)
+    finally:
+        s3.delete_bucket_policy(Bucket=upload)
+        for bucket in (secret, upload):
+            for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=item["Key"])
+            s3.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
+def test_s3_copy_source_in_the_query_string_is_authorized_contract(auth_enabled, iam_user, s3):
+    """x-amz-copy-source hoisted into the query string is checked like the header."""
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    from conftest import second_access_key
+
+    secret, upload = f"hoist-src-{uuid.uuid4().hex[:8]}", f"hoist-dst-{uuid.uuid4().hex[:8]}"
+    for bucket in (secret, upload):
+        s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=secret, Key="c", Body=b"secret")
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{upload}/*"}]})
+    try:
+        with second_access_key(user) as (key, secret_key):
+            url = f"{ENDPOINT}/{upload}/b?x-amz-copy-source=%2F{secret}%2Fc"
+            request = AWSRequest(method="PUT", url=url, data=b"")
+            S3SigV4Auth(Credentials(key, secret_key), "s3", "us-east-1").add_auth(request)
+            status = requests.put(url, data=b"", headers=dict(request.headers)).status_code
+        assert status == (403 if auth_enabled else 200)
+    finally:
+        for bucket in (secret, upload):
+            for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=item["Key"])
+            s3.delete_bucket(Bucket=bucket)
