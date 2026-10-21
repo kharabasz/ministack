@@ -10,6 +10,7 @@ import uuid as _uuid_mod
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -3109,13 +3110,29 @@ _VO_NOT_FOUND = "The specified vpc origin does not exist"
 _VO_NO_RESOURCE = "The specified resource doesn't exist. Update your request and try again."
 
 
-def _vo_alb_arn(account=_VO_ACCOUNT):
-    return (f"arn:aws:elasticloadbalancing:us-east-1:{account}:loadbalancer/app/"
-            f"vo-{_uuid_mod.uuid4().hex[:8]}/{_uuid_mod.uuid4().hex[:16]}")
+_vo_endpoints = {}
+
+
+def _vo_endpoint(kind="alb", index=0):
+    """A real load balancer or instance in MiniStack, created once per worker; AWS checks that the
+    endpoint exists (R1 V-arn/nlb-missing, alb-other-region, ec2-short-id; V C35)."""
+    key = (kind, index)
+    if key not in _vo_endpoints:
+        if kind == "instance":
+            ec2 = make_client("ec2")
+            instance = ec2.run_instances(ImageId="ami-00000000", MinCount=1, MaxCount=1, InstanceType="t3.nano")
+            instance_id = instance["Instances"][0]["InstanceId"]
+            _vo_endpoints[key] = f"arn:aws:ec2:us-east-1:{_VO_ACCOUNT}:instance/{instance_id}"
+        else:
+            lb = make_client("elbv2").create_load_balancer(
+                Name=f"vo-{kind}-{index}-{_uuid_mod.uuid4().hex[:8]}", Scheme="internal",
+                Type="network" if kind == "nlb" else "application")
+            _vo_endpoints[key] = lb["LoadBalancers"][0]["LoadBalancerArn"]
+    return _vo_endpoints[key]
 
 
 def _vo_cfg(**overrides):
-    cfg = {"Name": f"vo-{_uuid_mod.uuid4().hex[:12]}", "Arn": _vo_alb_arn(), "HTTPPort": 80, "HTTPSPort": 443,
+    cfg = {"Name": f"vo-{_uuid_mod.uuid4().hex[:12]}", "Arn": _vo_endpoint(), "HTTPPort": 80, "HTTPSPort": 443,
            "OriginProtocolPolicy": "https-only", "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]}}
     cfg.update(overrides)
     return cfg
@@ -3259,7 +3276,7 @@ def test_cloudfront_vpc_origin_names_are_unique_endpoints_are_not(cloudfront, vp
     R1 U8/create-on-endpoint-of-A: a second origin on the same endpoint is accepted."""
     cfg = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]
     with pytest.raises(ClientError) as exc:
-        cloudfront.create_vpc_origin(VpcOriginEndpointConfig={**cfg, "Arn": _vo_alb_arn()})
+        cloudfront.create_vpc_origin(VpcOriginEndpointConfig={**cfg, "Arn": _vo_endpoint("alb", 1)})
     assert _vo_error(exc) == (409, "EntityAlreadyExists",
                               "Another vpc origin with the same name already exists within the aws account.")
     other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Arn=cfg["Arn"]))
@@ -3306,7 +3323,7 @@ def test_cloudfront_vpc_origin_update_unchanged_and_onto_another_endpoint(cloudf
     cfg = got["VpcOrigin"]["VpcOriginEndpointConfig"]
     same = cloudfront.update_vpc_origin(Id=vo_id, IfMatch=got["ETag"], VpcOriginEndpointConfig=cfg)
     assert same["ResponseMetadata"]["HTTPStatusCode"] == 202
-    other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg())
+    other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Arn=_vo_endpoint("alb", 1)))
     try:
         moved = cloudfront.update_vpc_origin(Id=vo_id, IfMatch=cloudfront.get_vpc_origin(Id=vo_id)["ETag"],
                                              VpcOriginEndpointConfig={**cfg, "Arn": other["VpcOrigin"]["VpcOriginEndpointConfig"]["Arn"]})
@@ -3618,20 +3635,47 @@ def test_cloudfront_vpc_origin_create_rejects_raw_xml(make_body, expected):
     assert _vo_raw_error("POST", "/2020-05-31/vpc-origin", make_body(_vo_cfg())) == expected
 
 
-@pytest.mark.parametrize("arn_template", [
-    "arn:aws:elasticloadbalancing:us-east-1:{account}:loadbalancer/net/example/0123456789abcdef",  # R1 V-arn/nlb-missing (format accepted)
-    "arn:aws:elasticloadbalancing:us-west-2:{account}:loadbalancer/app/example/0123456789abcdef",  # R1 V-arn/alb-other-region (format accepted)
-    "arn:aws:ec2:us-east-1:{account}:instance/i-12345678",  # R1 V-arn/ec2-short-id (format accepted)
-    "arn:aws:ec2:us-east-1:{account}:instance/i-0123456789abcdef0",  # V C35/nonexistent-ec2-instance, create-real-ec2-instance
-], ids=["nlb", "alb-other-region", "ec2-short-id", "ec2"])
-def test_cloudfront_vpc_origin_accepts_endpoint_formats(cloudfront, arn_template):
-    """These endpoint ARNs pass AWS's format and account checks; AWS then looks the resource up
-    (LoadBalancerNotFound, InvalidInstanceID.*), which MiniStack does not do."""
-    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Arn=arn_template.format(account=_VO_ACCOUNT)))
+@pytest.mark.parametrize("arn,message", [
+    (f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef",
+     "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound."),  # R1 V-order/missing-alb+port0 etc.; V C35/nonexistent-alb-same-account
+    (f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/net/example/0123456789abcdef",
+     "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound."),  # R1 V-arn/nlb-missing
+    (f"arn:aws:elasticloadbalancing:us-west-2:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef",
+     "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound."),  # R1 V-arn/alb-other-region
+    (f"arn:aws:ec2:us-east-1:{_VO_ACCOUNT}:instance/i-12345678",
+     "The parameter VpcOriginEndpointConfig Arn InvalidInstanceID.NotFound."),  # R1 V-arn/ec2-short-id
+    (f"arn:aws:ec2:us-east-1:{_VO_ACCOUNT}:instance/i-0123456789abcdef0",
+     "The parameter VpcOriginEndpointConfig Arn InvalidInstanceID.Malformed."),  # V C35/nonexistent-ec2-instance
+    (f"arn:aws:ec2:us-west-2:{_VO_ACCOUNT}:instance/i-0123456789abcdef0",
+     "The parameter VpcOriginEndpointConfig Arn InvalidInstanceID.Malformed."),  # R1 V-arn/ec2-other-region
+], ids=["alb", "nlb", "alb-other-region", "ec2-short-id", "ec2", "ec2-other-region"])
+def test_cloudfront_vpc_origin_endpoint_must_exist(cloudfront, arn, message):
+    """An endpoint ARN with the right format and account must name a load balancer or instance that exists,
+    in the ARN's region."""
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Arn=arn))
+    assert _vo_error(exc) == (400, "InvalidArgument", message)
+
+
+@pytest.mark.parametrize("kind", ["alb", "nlb", "instance"])
+def test_cloudfront_vpc_origin_accepts_existing_endpoints(cloudfront, kind):
+    """R1 U-create/create-A (ALB), create-N (NLB), V C35/create-real-ec2-instance: an existing ALB, NLB or
+    instance is accepted (202)."""
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Arn=_vo_endpoint(kind)))
     try:
         assert created["ResponseMetadata"]["HTTPStatusCode"] == 202
     finally:
         _vo_delete(cloudfront, created["VpcOrigin"]["Id"])
+
+
+def test_cloudfront_vpc_origin_endpoint_checked_on_update(cloudfront, vpc_origin):
+    """R1 U9/update-A-current-etag-missing-alb: Update checks the endpoint too."""
+    got = cloudfront.get_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"])
+    missing = f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef"
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"], IfMatch=got["ETag"], VpcOriginEndpointConfig={
+            **got["VpcOrigin"]["VpcOriginEndpointConfig"], "Arn": missing})
+    assert _vo_error(exc) == (400, "InvalidArgument", "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound.")
 
 
 def test_cloudfront_vpc_origin_name_limits_accepted(cloudfront):
@@ -3966,21 +4010,26 @@ def test_cloudfront_update_distribution_rejects_unknown_vpc_origin(cloudfront, v
         _vo_delete_distribution(cloudfront, dist_id)
 
 
-def test_cloudfront_vpc_origin_etags_are_aws_per_version(cloudfront, vpc_origin):
-    """R1 U6, U4, U10 (headers): every origin gets the same ETag per version, E23ZP02F085DFQ at create,
-    ETVPDKIKX0DER once deployed, E3UN6WX5RRO2AG on update, E1F83G8C2ARO7P once redeployed.
-    R1 U10/delete-C-after-gone: such an ETag on an origin that doesn't exist answers 404, not InvalidIfMatchVersion."""
+def test_cloudfront_vpc_origin_etags_follow_the_version(cloudfront, vpc_origin):
+    """R1 U6, U4, U7, U10 (headers): every origin has the same ETag at the same version, and the version moves on at
+    the create, the end of its deployment, an update and the end of that deployment. MiniStack's values are uuid5s
+    (as for the managed policies). R1 U3/update-unknown-real-etag: a real ETag on an unknown id answers 404."""
     vo_id = vpc_origin["VpcOrigin"]["Id"]
-    assert vpc_origin["ETag"] == "E23ZP02F085DFQ"
-    got = cloudfront.get_vpc_origin(Id=vo_id)
-    assert got["ETag"] == "ETVPDKIKX0DER"
-    updated = cloudfront.update_vpc_origin(Id=vo_id, IfMatch=got["ETag"], VpcOriginEndpointConfig={
-        **got["VpcOrigin"]["VpcOriginEndpointConfig"], "HTTPSPort": 8443})
-    assert updated["ETag"] == "E3UN6WX5RRO2AG"
-    assert cloudfront.get_vpc_origin(Id=vo_id)["ETag"] == "E1F83G8C2ARO7P"
-    with pytest.raises(ClientError) as exc:
-        cloudfront.delete_vpc_origin(Id="vo_Y769dEbaneau0o63mXNjrY", IfMatch="ETVPDKIKX0DER")
-    assert _vo_error(exc) == (404, "EntityNotFound", _VO_NOT_FOUND)
+    other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg())
+    try:
+        assert other["ETag"] == vpc_origin["ETag"]
+        assert re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", vpc_origin["ETag"])
+        got = cloudfront.get_vpc_origin(Id=vo_id)
+        assert got["ETag"] == cloudfront.get_vpc_origin(Id=other["VpcOrigin"]["Id"])["ETag"] != vpc_origin["ETag"]
+        updated = cloudfront.update_vpc_origin(Id=vo_id, IfMatch=got["ETag"], VpcOriginEndpointConfig={
+            **got["VpcOrigin"]["VpcOriginEndpointConfig"], "HTTPSPort": 8443})
+        after = cloudfront.get_vpc_origin(Id=vo_id)["ETag"]
+        assert len({vpc_origin["ETag"], got["ETag"], updated["ETag"], after}) == 4
+        with pytest.raises(ClientError) as exc:
+            cloudfront.delete_vpc_origin(Id="vo_Y769dEbaneau0o63mXNjrY", IfMatch=got["ETag"])
+        assert _vo_error(exc) == (404, "EntityNotFound", _VO_NOT_FOUND)
+    finally:
+        _vo_delete(cloudfront, other["VpcOrigin"]["Id"])
 
 
 @pytest.mark.parametrize("inner_kw,expected", [

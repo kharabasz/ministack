@@ -3263,8 +3263,8 @@ def _untag_resource(resource_arn, body):
 # with Status Deploying and finishes it minutes later; MiniStack finishes it at
 # once, so a later read shows Deployed and a deleted origin is gone; AWS's
 # LastModifiedTime also moves on when a deployment ends, MiniStack's doesn't. The endpoint
-# ARN's format and account are checked; whether the load balancer or instance
-# exists is not. Viewer requests are never routed to the VPC endpoint.
+# ARN's format and account are checked, and the load balancer or instance must exist
+# in MiniStack's ELBv2 or EC2 state. Viewer requests are never routed to the VPC endpoint.
 
 _VPC_ORIGIN_POLICIES = ("https-only", "http-only", "match-viewer")
 _VPC_ORIGIN_SSL_PROTOCOLS = ("SSLv3", "TLSv1", "TLSv1.1", "TLSv1.2")
@@ -3278,10 +3278,7 @@ _VPC_ORIGIN_ENDPOINT_RESOURCE_RE = {
     "elasticloadbalancing": re.compile(r"^loadbalancer/(app|net)/[^/]+/[^/]+$"),
     "ec2": re.compile(r"^instance/i-[0-9A-Za-z]+$"),
 }
-# The ETags AWS issued for versions 1 to 4, identical for every origin and account
-# seen; later versions get MiniStack's own value.
-_VPC_ORIGIN_AWS_ETAGS = ("E23ZP02F085DFQ", "ETVPDKIKX0DER", "E3UN6WX5RRO2AG", "E1F83G8C2ARO7P")
-_VPC_ORIGIN_ETAG_RE = re.compile(r"^EMS[0-9A-F]{11}$")
+_VPC_ORIGIN_ETAG_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _VPC_ORIGIN_LOCATION = "https://cloudfront.amazonaws.com/2020-05-31/vpc-origin/"
 _VPC_ORIGIN_MAX_ITEMS = 100
 _VPC_ORIGIN_NOT_FOUND = "The specified vpc origin does not exist"
@@ -3295,10 +3292,9 @@ _VPC_ORIGIN_IN_USE = ("The specified VPC origin is currently associated with one
 def _vpc_origin_etag(version):
     """AWS's ETag follows the origin's version, so origins at the same version share
     it. The version counts every change: a create, update or delete, and the end of
-    the deployment that follows it."""
-    if version <= len(_VPC_ORIGIN_AWS_ETAGS):
-        return _VPC_ORIGIN_AWS_ETAGS[version - 1]
-    return f"EMS{version:011X}"
+    the deployment that follows it. The value is a uuid5 of the version, like
+    ``_managed_etag`` (real AWS ETags are opaque)."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"ministack-cloudfront-vpc-origin/version/{version}"))
 
 
 def _vpc_origin_validation_error(problems):
@@ -3422,7 +3418,25 @@ def _vpc_origin_endpoint_error(arn):
     if spec.account_id != get_account_id():
         return _error("InvalidArgument", "The parameter VpcOriginEndpointConfig Arn contains a mismatched AWS account.",
                       400)
-    return None
+    return _vpc_origin_endpoint_missing(spec, arn)
+
+
+def _vpc_origin_endpoint_missing(spec, arn):
+    """The load balancer or instance must exist in the ARN's account and region."""
+    if spec.service == "elasticloadbalancing":
+        from ministack.services import alb
+
+        if alb._lbs.contains_scoped(spec.account_id, spec.region, arn):
+            return None
+        return _error("InvalidArgument", "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound.", 400)
+    from ministack.services import ec2
+
+    instance_id = spec.resource.split("/", 1)[1]
+    if ec2._instances.contains_scoped(spec.account_id, spec.region, instance_id):
+        return None
+    # AWS answers NotFound for a short (8-character) id and Malformed for a long one.
+    reason = "InvalidInstanceID.NotFound" if len(instance_id) == len("i-12345678") else "InvalidInstanceID.Malformed"
+    return _error("InvalidArgument", f"The parameter VpcOriginEndpointConfig Arn {reason}.", 400)
 
 
 def _check_vpc_origin_endpoint_config(fields):
@@ -3544,9 +3558,8 @@ def _vpc_origin_lookup(vo_id):
 
 
 def _vpc_origin_bad_if_match(if_match):
-    """An ETag that names no version; checked before the origin is looked up."""
-    if if_match not in _VPC_ORIGIN_AWS_ETAGS and not (
-            _VPC_ORIGIN_ETAG_RE.match(if_match) and int(if_match[3:], 16) > len(_VPC_ORIGIN_AWS_ETAGS)):
+    """An If-Match that isn't an ETag's shape; checked before the origin is looked up."""
+    if not _VPC_ORIGIN_ETAG_RE.match(if_match):
         return _error("InvalidIfMatchVersion", _VPC_ORIGIN_BAD_IF_MATCH, 400)
     return None
 
