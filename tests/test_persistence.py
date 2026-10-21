@@ -723,20 +723,23 @@ def test_s3_object_lambda_access_points_round_trip_without_pending_requests():
 
 def test_cloudfront_vpc_origins_round_trip_every_account():
     """CloudFront VPC origins are account-scoped; a restart keeps every account's."""
-    def record(account, vo_id):
+    def record(account, vo_id, version):
         return {"Id": vo_id, "Arn": f"arn:aws:cloudfront::{account}:vpcorigin/{vo_id}", "AccountId": account,
-                "Status": "Deployed", "Version": 4, "VpcOriginEndpointConfig": {"Name": "api"}}
+                "Status": "Deployed", "Version": version, "VpcOriginEndpointConfig": {"Name": "api"}}
 
     def populate(mod):
-        mod._vpc_origins.set_scoped("111111111111", "us-east-1", "vo_a", record("111111111111", "vo_a"))
-        mod._vpc_origins.set_scoped("222222222222", "us-east-1", "vo_b", record("222222222222", "vo_b"))
+        mod._vpc_origins.set_scoped("111111111111", "us-east-1", "vo_a", record("111111111111", "vo_a", 4))
+        mod._vpc_origins.set_scoped("222222222222", "us-east-1", "vo_b", record("222222222222", "vo_b", 6))
+        # A deleted origin had reached version 8: its ETags must stay valid too (R1 U10/delete-C-after-gone).
+        for version in range(1, 9):
+            mod._vpc_origin_etag(version)
 
     def observe(mod):
         assert mod._vpc_origins.get_scoped("111111111111", "us-east-1", "vo_a")["AccountId"] == "111111111111"
-        assert mod._vpc_origins.get_scoped("222222222222", "us-east-1", "vo_b")["Version"] == 4
+        assert mod._vpc_origins.get_scoped("222222222222", "us-east-1", "vo_b")["Version"] == 6
         assert not mod._vpc_origins.contains_scoped("111111111111", "us-east-1", "vo_b")
-        # Every version's ETag is valid again for If-Match after a restart.
-        assert sorted(set(mod._vpc_origin_etags_issued.values())) == [1, 2, 3, 4]
+        # Every version's ETag issued before the restart is valid again for If-Match.
+        assert sorted(set(mod._vpc_origin_etags_issued.values())) == list(range(1, 9))
 
     _round_trip("cloudfront", "cloudfront", populate, observe)
 

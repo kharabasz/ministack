@@ -227,6 +227,7 @@ def get_state():
             "distribution_tenants": _distribution_tenants,
             "tenant_invalidations": _tenant_invalidations,
             "vpc_origins": _vpc_origins,
+            "vpc_origin_max_version": max(_vpc_origin_etags_issued.values(), default=0),
         }
     )
 
@@ -250,9 +251,10 @@ def _restore_state(data):
     _connection_groups.update(data.get("connection_groups", {}))
     _distribution_tenants.update(data.get("distribution_tenants", {}))
     _vpc_origins.update(data.get("vpc_origins", {}))
-    for vo in _vpc_origins._data.values():
-        for version in range(1, vo.get("Version", 0) + 1):
-            _vpc_origin_etag(version)
+    # An ETag issued before the restart, also by an origin deleted since, stays a valid If-Match.
+    stored = max((vo.get("Version", 0) for vo in _vpc_origins._data.values()), default=0)
+    for version in range(1, max(stored, data.get("vpc_origin_max_version", 0)) + 1):
+        _vpc_origin_etag(version)
     _tenant_invalidations.update(data.get("tenant_invalidations", {}))
 
 
