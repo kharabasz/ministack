@@ -735,6 +735,8 @@ def test_cloudfront_vpc_origins_round_trip_every_account():
         assert mod._vpc_origins.get_scoped("111111111111", "us-east-1", "vo_a")["AccountId"] == "111111111111"
         assert mod._vpc_origins.get_scoped("222222222222", "us-east-1", "vo_b")["Version"] == 4
         assert not mod._vpc_origins.contains_scoped("111111111111", "us-east-1", "vo_b")
+        # Every version's ETag is valid again for If-Match after a restart.
+        assert sorted(set(mod._vpc_origin_etags_issued.values())) == [1, 2, 3, 4]
 
     _round_trip("cloudfront", "cloudfront", populate, observe)
 

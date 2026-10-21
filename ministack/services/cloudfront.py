@@ -202,6 +202,7 @@ def reset():
     _distribution_tenants.clear()
     _tenant_invalidations.clear()
     _vpc_origins.clear()
+    _vpc_origin_etags_issued.clear()
     # Drop the JS workers so their compiled-function cache does not outlive a
     # reset (mirrors appsync.reset()'s appsync_js.reset()).
     from ministack.core import cloudfront_js
@@ -249,6 +250,9 @@ def _restore_state(data):
     _connection_groups.update(data.get("connection_groups", {}))
     _distribution_tenants.update(data.get("distribution_tenants", {}))
     _vpc_origins.update(data.get("vpc_origins", {}))
+    for vo in _vpc_origins._data.values():
+        for version in range(1, vo.get("Version", 0) + 1):
+            _vpc_origin_etag(version)
     _tenant_invalidations.update(data.get("tenant_invalidations", {}))
 
 
@@ -3278,7 +3282,7 @@ _VPC_ORIGIN_ENDPOINT_RESOURCE_RE = {
     "elasticloadbalancing": re.compile(r"^loadbalancer/(app|net)/[^/]+/[^/]+$"),
     "ec2": re.compile(r"^instance/i-[0-9A-Za-z]+$"),
 }
-_VPC_ORIGIN_ETAG_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_vpc_origin_etags_issued = {}  # ETag -> version, for every version an origin has reached
 _VPC_ORIGIN_LOCATION = "https://cloudfront.amazonaws.com/2020-05-31/vpc-origin/"
 _VPC_ORIGIN_MAX_ITEMS = 100
 _VPC_ORIGIN_NOT_FOUND = "The specified vpc origin does not exist"
@@ -3294,7 +3298,9 @@ def _vpc_origin_etag(version):
     it. The version counts every change: a create, update or delete, and the end of
     the deployment that follows it. The value is a uuid5 of the version, like
     ``_managed_etag`` (real AWS ETags are opaque)."""
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"ministack-cloudfront-vpc-origin/version/{version}"))
+    etag = str(uuid.uuid5(uuid.NAMESPACE_URL, f"ministack-cloudfront-vpc-origin/version/{version}"))
+    _vpc_origin_etags_issued.setdefault(etag, version)
+    return etag
 
 
 def _vpc_origin_validation_error(problems):
@@ -3558,8 +3564,9 @@ def _vpc_origin_lookup(vo_id):
 
 
 def _vpc_origin_bad_if_match(if_match):
-    """An If-Match that isn't an ETag's shape; checked before the origin is looked up."""
-    if not _VPC_ORIGIN_ETAG_RE.match(if_match):
+    """An If-Match that is no version's ETag; checked before the origin is looked up.
+    AWS refuses a well-formed ETag it never issued, and accepts an issued one on any id."""
+    if if_match not in _vpc_origin_etags_issued:
         return _error("InvalidIfMatchVersion", _VPC_ORIGIN_BAD_IF_MATCH, 400)
     return None
 

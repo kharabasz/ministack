@@ -3637,7 +3637,7 @@ def test_cloudfront_vpc_origin_create_rejects_raw_xml(make_body, expected):
 
 @pytest.mark.parametrize("arn,message", [
     (f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef",
-     "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound."),  # R1 V-order/missing-alb+port0 etc.; V C35/nonexistent-alb-same-account
+     "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound."),  # V C35/nonexistent-alb-same-account
     (f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/net/example/0123456789abcdef",
      "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound."),  # R1 V-arn/nlb-missing
     (f"arn:aws:elasticloadbalancing:us-west-2:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef",
@@ -3660,7 +3660,9 @@ def test_cloudfront_vpc_origin_endpoint_must_exist(cloudfront, arn, message):
 @pytest.mark.parametrize("kind", ["alb", "nlb", "instance"])
 def test_cloudfront_vpc_origin_accepts_existing_endpoints(cloudfront, kind):
     """R1 U-create/create-A (ALB), create-N (NLB), V C35/create-real-ec2-instance: an existing ALB, NLB or
-    instance is accepted (202)."""
+    instance is accepted (202). MiniStack's ELBv2 names every load balancer's ARN `loadbalancer/app/...`, also
+    for Type=network, so the NLB case uses that ARN; the `loadbalancer/net/` format itself is covered by
+    R1 V-arn/nlb-missing in test_cloudfront_vpc_origin_endpoint_must_exist."""
     created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Arn=_vo_endpoint(kind)))
     try:
         assert created["ResponseMetadata"]["HTTPStatusCode"] == 202
@@ -3814,6 +3816,8 @@ def test_cloudfront_vpc_origin_names_are_case_sensitive(cloudfront, vpc_origin):
     ({"Arn": "arn:aws:s3:::bucket"}, _VO_BAD_ARN),  # R2 V-name/dup-name+s3-arn
     ({"Arn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/vo-other/0123456789abcdef"},
      _VO_OTHER_ACCOUNT),  # R2 V-name/dup-name+other-account
+    ({"Arn": f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef"},
+     (400, "InvalidArgument", "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound.")),  # R2 V-name/dup-name+missing-alb
 ])
 def test_cloudfront_vpc_origin_name_taken_is_checked_last(cloudfront, vpc_origin, overrides, expected):
     """R2 V-name/dup-name+*: a reused name is reported only after every other check passes."""
@@ -4013,7 +4017,8 @@ def test_cloudfront_update_distribution_rejects_unknown_vpc_origin(cloudfront, v
 def test_cloudfront_vpc_origin_etags_follow_the_version(cloudfront, vpc_origin):
     """R1 U6, U4, U7, U10 (headers): every origin has the same ETag at the same version, and the version moves on at
     the create, the end of its deployment, an update and the end of that deployment. MiniStack's values are uuid5s
-    (as for the managed policies). R1 U3/update-unknown-real-etag: a real ETag on an unknown id answers 404."""
+    (as for the managed policies). R1 U3/delete-unknown-real-etag, U10/delete-C-after-gone: an issued ETag on an
+    unknown id answers 404; R1 U1/update-A-fake-etag: a well-formed ETag that was never issued answers 400."""
     vo_id = vpc_origin["VpcOrigin"]["Id"]
     other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg())
     try:
@@ -4028,6 +4033,13 @@ def test_cloudfront_vpc_origin_etags_follow_the_version(cloudfront, vpc_origin):
         with pytest.raises(ClientError) as exc:
             cloudfront.delete_vpc_origin(Id="vo_Y769dEbaneau0o63mXNjrY", IfMatch=got["ETag"])
         assert _vo_error(exc) == (404, "EntityNotFound", _VO_NOT_FOUND)
+        never_issued = str(_uuid_mod.uuid4())
+        for call in (lambda: cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=never_issued),
+                     lambda: cloudfront.update_vpc_origin(Id=vo_id, IfMatch=never_issued,
+                                                          VpcOriginEndpointConfig=got["VpcOrigin"]["VpcOriginEndpointConfig"])):
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert _vo_error(exc) == (400, "InvalidIfMatchVersion", _VO_BAD_IF_MATCH)
     finally:
         _vo_delete(cloudfront, other["VpcOrigin"]["Id"])
 
