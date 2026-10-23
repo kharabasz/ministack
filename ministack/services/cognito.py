@@ -818,6 +818,7 @@ def _token_validity(pool_id: str, client_id: str, token_type: str) -> int:
 
 
 _API_TOKEN_SCOPE = "aws.cognito.signin.user.admin"
+_STANDARD_OAUTH_SCOPES = ("openid", "email", "phone", "profile", _API_TOKEN_SCOPE)
 
 
 def _aws_scope_order(scopes: list[str], presized: bool = True) -> list[str]:
@@ -859,7 +860,7 @@ def _id_token_granted(scope: str | None) -> bool:
 
 
 def _client_credentials_scope_error(pool: dict, client: dict, requested: str | None):
-    """invalid_scope for a non-custom scope or no defined one, invalid_grant for one the client doesn't allow."""
+    """invalid_scope for a non-custom scope or no defined one, invalid_grant for one or a flow the client lacks."""
     allowed = client.get("AllowedOAuthScopes") or []
     wanted = requested.split() if requested else [s for s in allowed if "/" in s]
     defined = {
@@ -867,8 +868,13 @@ def _client_credentials_scope_error(pool: dict, client: dict, requested: str | N
         for identifier, server in (pool.get("_resource_servers") or {}).items()
         for scope in server.get("Scopes", [])
     }
+    if "client_credentials" not in (client.get("AllowedOAuthFlows") or []):
+        # Unknown scopes fail first; known ones get invalid_grant without the flow
+        known = [scope for scope in wanted if scope in defined or scope in _STANDARD_OAUTH_SCOPES]
+        unknown = any("/" not in scope and scope not in _STANDARD_OAUTH_SCOPES for scope in wanted)
+        error = "invalid_scope" if unknown or not known else "invalid_grant"
     # An undefined resource server scope is dropped when a defined one is requested
-    if (requested and not wanted) or any("/" not in scope for scope in wanted):
+    elif (requested and not wanted) or any("/" not in scope for scope in wanted):
         error = "invalid_scope"
     elif any(scope in defined and scope not in allowed for scope in wanted):
         error = "invalid_grant"
@@ -1042,6 +1048,9 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
         return claims
     # V1_0 only fires for id tokens.
     if not use_v2 and token_type != "id":
+        return claims
+    # Client credentials grants only fire V3_0.
+    if trigger_source == "TokenGeneration_ClientCredentials" and v2_version != "V3_0":
         return claims
 
     event = _build_pretoken_event(
@@ -2295,6 +2304,39 @@ def _oidc_callback_url(pool: dict) -> str:
     """OIDC callback URL — external OIDC IdPs redirect back here with `code`+`state`."""
     base = _pool_domain_base_url(pool) or f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
     return f"{base}/oauth2/idpresponse"
+
+
+# ProviderDetails key -> OpenID Provider metadata key for the same endpoint.
+_OIDC_DISCOVERED_ENDPOINTS = {"authorize_url": "authorization_endpoint", "token_url": "token_endpoint"}
+
+
+def _oidc_endpoint(details: dict, key: str) -> str:
+    """An external OIDC IdP endpoint: the ProviderDetails value, else the one its issuer's discovery document advertises; "" if neither.
+
+    AWS takes `authorize_url` / `token_url` only for an IdP whose endpoints it
+    can't discover from `oidc_issuer`, so an issuer such as Google's, whose
+    endpoints are not `{issuer}/authorize` and `{issuer}/token`, works with
+    `oidc_issuer` alone. The document must name the configured issuer
+    (OpenID Connect Discovery 1.0, section 4.3).
+    """
+    import urllib.request
+
+    if details.get(key):
+        return details[key]
+    issuer = details.get("oidc_issuer", "")
+    if not issuer:
+        return ""
+    try:
+        with urllib.request.urlopen(f"{issuer.rstrip('/')}/.well-known/openid-configuration", timeout=10) as resp:
+            metadata = json.loads(resp.read().decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("Cognito: OIDC discovery for %s failed: %s", issuer, exc)
+        return ""
+    if not isinstance(metadata, dict) or metadata.get("issuer") != issuer:
+        logger.warning("Cognito: OIDC discovery document of %s names another issuer", issuer)
+        return ""
+    url = metadata.get(_OIDC_DISCOVERED_ENDPOINTS[key])
+    return url if isinstance(url, str) else ""
 
 
 def _saml_sso_url_from_metadata(metadata_xml: str) -> str:
@@ -4321,7 +4363,6 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     mfa_config = pool.get("MfaConfiguration", "OFF")
     if mfa_config == "OFF":
         return None
-    preferred = user.get("_preferred_mfa", "")
     enabled_mfa = user.get("_mfa_enabled", [])
     # OPTIONAL: only challenge if user has TOTP set up
     if mfa_config == "OPTIONAL" and "SOFTWARE_TOKEN_MFA" not in enabled_mfa:
@@ -5209,7 +5250,6 @@ def _confirmation_code_error(action: str, data: dict):
 def _confirm_sign_up(data):
     cid = data.get("ClientId")
     username = data.get("Username")
-    code = data.get("ConfirmationCode", "")
 
     pool = None
     for p in _user_pools.values():
@@ -6621,11 +6661,10 @@ def _oauth2_authorize_federation(query_params):
         })
     elif provider_type == "OIDC":
         # OIDC authorize redirect
-        oidc_issuer = details.get("oidc_issuer", "")
-        authorize_url = details.get("authorize_url", f"{oidc_issuer}/authorize" if oidc_issuer else "")
+        authorize_url = _oidc_endpoint(details, "authorize_url")
         if not authorize_url:
             return error_response_json("InvalidParameterException",
-                                       "OIDC provider has no oidc_issuer or authorize_url.", 400)
+                                       "OIDC provider has no authorize_url and none was discovered from its oidc_issuer.", 400)
         oidc_client_id = details.get("client_id", "")
         redirect_url = authorize_url + ("&" if "?" in authorize_url else "?") + urlencode({
             "response_type": response_type or "code",
@@ -6943,11 +6982,10 @@ def _oauth2_idp_response(method, body, query_params):
                                    f"OIDC provider {provider_name} not found.", 400)
 
     details = provider.get("ProviderDetails", {})
-    oidc_issuer = details.get("oidc_issuer", "")
-    token_url = details.get("token_url") or (f"{oidc_issuer}/token" if oidc_issuer else "")
+    token_url = _oidc_endpoint(details, "token_url")
     if not token_url:
         return error_response_json("InvalidParameterException",
-                                   "OIDC provider has no token_url or oidc_issuer.", 400)
+                                   "OIDC provider has no token_url and none was discovered from its oidc_issuer.", 400)
 
     oidc_client_id = details.get("client_id", "")
     oidc_client_secret = details.get("client_secret", "")
@@ -7655,14 +7693,14 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         pool_id, pool, client = _find_pool_by_client_id(cid)
         if not pool or not client:
             return _oauth2_error("invalid_client", "Client not found.")
-        if not client.get("ClientSecret"):
-            return _oauth2_error("invalid_client", "client_credentials requires a confidential client.")
-        if csec != client["ClientSecret"]:
+        if csec != (client.get("ClientSecret") or ""):
             return _oauth2_error("invalid_client", "Invalid client credentials.")
 
         scope_error = _client_credentials_scope_error(pool, client, form.get("scope"))
         if scope_error:
             return scope_error
+        if not client.get("ClientSecret"):
+            return _oauth2_error("invalid_client", "client_credentials requires a confidential client.")
 
         # M2M's own client-metadata channel — a JSON object, urlencoded, in
         # the aws_client_metadata POST field (there's no ClientMetadata

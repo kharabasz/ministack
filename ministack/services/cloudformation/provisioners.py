@@ -1463,10 +1463,19 @@ def _s3_website_xml(website):
     return tostring(root, encoding="utf-8")
 
 
+def _s3_default_public_access_block(name):
+    """A removed PublicAccessBlockConfiguration leaves the settings of a new bucket (all four on under AUTH=true)."""
+    default = _s3._new_bucket_public_access_block()
+    if default:
+        _s3._put_public_access_block(name, default["_public_access_block"].encode())
+    else:
+        _s3._delete_public_access_block(name)
+
+
 _S3_BUCKET_CONFIGURATIONS = (
     ("CorsConfiguration", _s3_cors_xml, _s3._put_bucket_cors, _s3._delete_bucket_cors),
     ("PublicAccessBlockConfiguration", _s3_public_access_block_xml,
-     _s3._put_public_access_block, _s3._delete_public_access_block),
+     _s3._put_public_access_block, _s3_default_public_access_block),
     ("WebsiteConfiguration", _s3_website_xml, _s3._put_bucket_website, _s3._delete_bucket_website),
 )
 
@@ -1669,6 +1678,7 @@ def _s3_create(logical_id, props, stack_name):
         "created": now_iso(),
         "objects": {},
         "region": get_region(),
+        **_s3._new_bucket_public_access_block(),
     })
     versioning = props.get("VersioningConfiguration", {})
     if versioning.get("Status") == "Enabled":
@@ -1685,7 +1695,6 @@ def _s3_update(physical_id, old_props, new_props, stack_name):
     Auto-named buckets (no explicit ``BucketName``) must keep their existing
     physical resource id so that ``Ref`` keeps resolving to the same bucket
     where artifacts were uploaded."""
-    old_name = old_props.get("BucketName")
     new_name = new_props.get("BucketName")
     if new_name and new_name != physical_id:
         return _s3_create(new_name, new_props, stack_name)
@@ -5071,7 +5080,6 @@ def _cfn_nested_stack_delete(physical_id, props):
     if not child_stack:
         return
 
-    child_stack_id = child_stack.get("StackId", physical_id)
     resources = child_stack.get("_resources", {})
     template = child_stack.get("_template", {})
     res_defs = template.get("Resources", {}) if template else {}
@@ -7976,7 +7984,6 @@ def _ec2_vpc_create(logical_id, props, stack_name):
     }
     _ec2_vpc_dns_attributes(_ec2._vpcs[vpc_id], props)
     _ec2_apply_tags(vpc_id, props)
-    arn = f"arn:aws:ec2:{get_region()}:{get_account_id()}:vpc/{vpc_id}"
     return vpc_id, {"VpcId": vpc_id, "DefaultSecurityGroup": sg_id, "DefaultNetworkAcl": acl_id}
 
 
@@ -10633,8 +10640,7 @@ def _cw_metric_alarm_record(name, props):
         "Unit": props.get("Unit"),
         "AlarmConfigurationUpdatedTimestamp": int(time.time()),
     }
-    # As with PutMetricAlarm, AWS describes DatapointsToAlarm only while the
-    # template sets it, on create and on update.
+    # AWS describes DatapointsToAlarm only while the template sets it.
     if dta is not None:
         alarm["DatapointsToAlarm"] = int(dta)
     return alarm
@@ -11902,6 +11908,10 @@ def _rds_db_instance_fields(props):
         "DBInstanceClass": props.get("DBInstanceClass", "db.t3.micro"),
         "EngineVersion": engine_version,
         "AllocatedStorage": int(props.get("AllocatedStorage") or 20),
+        # Set only when it turns storage autoscaling on (above AllocatedStorage).
+        "MaxAllocatedStorage": (int(props["MaxAllocatedStorage"]) if props.get("MaxAllocatedStorage")
+                                and int(props["MaxAllocatedStorage"]) != int(props.get("AllocatedStorage") or 20)
+                                else None),
         "StorageType": props.get("StorageType", "gp2"),
         "PreferredBackupWindow": props.get("PreferredBackupWindow", "03:00-04:00"),
         "BackupRetentionPeriod": int(props.get("BackupRetentionPeriod", 1)),

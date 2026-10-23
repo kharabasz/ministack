@@ -913,6 +913,40 @@ def test_cfn_s3_bucket_cors_public_access_block_and_website(cfn, s3):
     _wait_stack(cfn, "cfn-s3-configs")
 
 
+
+@pytest.mark.auth_contract
+def test_cfn_s3_bucket_without_public_access_block_contract(auth_enabled, cfn, s3):
+    """Under AUTH=true a template bucket without PublicAccessBlockConfiguration, or whose update removes it, has all
+    four settings on; without AUTH it has none."""
+    bucket = "cfn-s3-pab-default-bucket"
+    all_on = dict.fromkeys(("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"), True)
+
+    def template(props):
+        return json.dumps({"AWSTemplateFormatVersion": "2010-09-09", "Resources": {
+            "Bucket": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": bucket, **props}}}})
+
+    def settings():
+        try:
+            return s3.get_public_access_block(Bucket=bucket)["PublicAccessBlockConfiguration"]
+        except ClientError as exc:
+            return exc.response["Error"]["Code"]
+
+    cfn.create_stack(StackName="cfn-s3-pab-default", TemplateBody=template({}))
+    assert _wait_stack(cfn, "cfn-s3-pab-default")["StackStatus"] == "CREATE_COMPLETE"
+    try:
+        expected = all_on if auth_enabled else "NoSuchPublicAccessBlockConfiguration"
+        assert settings() == expected
+        cfn.update_stack(StackName="cfn-s3-pab-default", TemplateBody=template({"PublicAccessBlockConfiguration": {
+            "BlockPublicAcls": False, "IgnorePublicAcls": True}}))
+        assert _wait_stack(cfn, "cfn-s3-pab-default")["StackStatus"] == "UPDATE_COMPLETE"
+        assert settings()["IgnorePublicAcls"] is True
+        cfn.update_stack(StackName="cfn-s3-pab-default", TemplateBody=template({}))
+        assert _wait_stack(cfn, "cfn-s3-pab-default")["StackStatus"] == "UPDATE_COMPLETE"
+        assert settings() == expected
+    finally:
+        cfn.delete_stack(StackName="cfn-s3-pab-default")
+        _wait_stack(cfn, "cfn-s3-pab-default")
+
 def test_cfn_iot_and_cognito_role_attachment(cfn, iot_client, cognito_identity):
     """AWS::IoT::ThingType, AWS::IoT::Policy, and
     AWS::Cognito::IdentityPoolRoleAttachment provision onto their real services
@@ -36336,7 +36370,7 @@ def _ec_cache_stack(s, *, rg_description="sessions", num_cache_clusters=2,
         "Subnets": {"Type": "AWS::ElastiCache::SubnetGroup", "Properties": {
             "CacheSubnetGroupName": f"subnets-{s}",
             "Description": subnet_description,
-            "SubnetIds": ["subnet-aaa", "subnet-bbb"],
+            "SubnetIds": ["subnet-00000001", "subnet-00000002"],
         }},
         "Params": {"Type": "AWS::ElastiCache::ParameterGroup", "Properties": {
             "CacheParameterGroupFamily": "redis7",
@@ -36411,7 +36445,7 @@ def test_cfn_elasticache_stack_create_and_delete(cfn, ec):
     try:
         groups = ec.describe_cache_subnet_groups(CacheSubnetGroupName=f"subnets-{s}")
         subnets = groups["CacheSubnetGroups"][0]["Subnets"]
-        assert [n["SubnetIdentifier"] for n in subnets] == ["subnet-aaa", "subnet-bbb"]
+        assert [n["SubnetIdentifier"] for n in subnets] == ["subnet-00000001", "subnet-00000002"]
         assert _ec_params(ec, out["Params"])["maxmemory-policy"] == "allkeys-lru"
 
         user = ec.describe_users(UserId=f"app-{s}")["Users"][0]
@@ -36518,9 +36552,9 @@ def test_cfn_elasticache_generated_cluster_replaced_on_create_only_change(cfn, e
         return {
             "Resources": {
                 "A": {"Type": "AWS::ElastiCache::SubnetGroup", "Properties": {
-                    "Description": "a", "SubnetIds": ["subnet-a"]}},
+                    "Description": "a", "SubnetIds": ["subnet-00000001"]}},
                 "B": {"Type": "AWS::ElastiCache::SubnetGroup", "Properties": {
-                    "Description": "b", "SubnetIds": ["subnet-b"]}},
+                    "Description": "b", "SubnetIds": ["subnet-00000002"]}},
                 "C": {"Type": "AWS::ElastiCache::CacheCluster", "Properties": {
                     "Engine": "redis", "CacheNodeType": "cache.t3.micro", "NumCacheNodes": 1,
                     "CacheSubnetGroupName": {"Ref": subnet_ref}, "SnapshotRetentionLimit": retention}},

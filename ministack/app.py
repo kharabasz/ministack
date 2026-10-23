@@ -859,10 +859,15 @@ async def _send_if_handled(send, response, receive=None) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _handle_options_request(method: str, request_id: str):
-    """Return the standard CORS preflight response when applicable."""
+def _handle_options_request(method: str, path: str, headers: dict, query_params: dict, request_id: str):
+    """Return the CORS preflight response when applicable."""
     if method != "OPTIONS":
         return None
+    target = _s3_cors_target(headers.get("host", ""), path) if AUTH else None
+    if target and detect_service(method, path, headers, query_params) == "s3":
+        # Under AUTH a bucket's CORS configuration answers the preflight.
+        status, resp_headers, body = _get_module("s3").cors_preflight(*target, headers)
+        return status, {**resp_headers, "x-amzn-requestid": request_id, "x-amz-request-id": request_id}, body
     return (
         200,
         {
@@ -1292,7 +1297,7 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
         or _parse_cloudfront_dataplane_host(host) is not None
     )
     for response in (
-        None if owns_cors else _handle_options_request(method, request_id),
+        None if owns_cors else _handle_options_request(method, path, headers, query_params, request_id),
         _handle_health_request(path, request_id),
         _handle_ready_request(path, request_id),
         _handle_unknown_localstack_request(path, request_id),
@@ -2056,7 +2061,10 @@ async def _handle_execute_api_request(
             http_api_path = apigw_v2.decode_http_api_path(raw_path)
             if http_api_path.startswith(prefix):
                 execute_path = http_api_path[len(prefix):]
-        return await apigw_v2.handle_execute(api_id, stage, execute_path, method, headers, body, query_params)
+        status, resp_headers, resp_body = await apigw_v2.handle_execute(api_id, stage, execute_path, method, headers, body, query_params)
+        # An HTTP API names its request id apigw-requestid (16 base64 characters); x-amzn-requestid is a REST API's.
+        resp_headers.setdefault("apigw-requestid", base64.b64encode(os.urandom(11)).decode())
+        return status, resp_headers, resp_body
     except Exception as e:
         logger.exception("Error in execute-api dispatch: %s", e)
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
@@ -2389,6 +2397,20 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         )
 
 
+def _s3_cors_target(host: str, path: str, path_style: bool = True) -> tuple[str, str] | None:
+    """``(bucket, key)`` of an existing bucket a request addresses by virtual host or path, for its CORS answer."""
+    bucket = _extract_s3_vhost_bucket(host)
+    if bucket and not _S3_VHOST_EXCLUDE_RE.search(host) and bucket not in _NON_S3_VHOST_NAMES:
+        key = path.lstrip("/")
+    elif path_style:
+        bucket, _, key = path.lstrip("/").partition("/")
+    else:
+        return None
+    if not bucket or _get_module("s3")._bucket_owner_account(bucket) is None:
+        return None
+    return bucket, key
+
+
 def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = False, wildcard_cors: bool = True):
     """Attach common data-plane request-id headers to a response tuple.
 
@@ -2402,6 +2424,8 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
     status, headers, body = response
     if wildcard_cors and "Access-Control-Allow-Origin" not in headers:
         headers["Access-Control-Allow-Origin"] = "*"
+    if "apigw-requestid" in headers:
+        return status, headers, body
     # An API Gateway gateway response already carries the id it rendered.
     request_id = headers.setdefault("x-amzn-requestid", request_id)
     if include_s3_id:
@@ -2623,7 +2647,9 @@ async def _handle_special_data_plane_request(
     if response := await _handle_lambda_url_request(host, path, method, headers, body, query_params):
         return _with_data_plane_headers(response, request_id, wildcard_cors=False)
     if response := await _handle_s3_vhost_request(host, path, method, headers, body, query_params):
-        return _with_data_plane_headers(response, request_id, include_s3_id=True)
+        if AUTH and (target := _s3_cors_target(host, path, path_style=False)):
+            response[1].update(_get_module("s3").cors_response_headers(target[0], method, headers))
+        return _with_data_plane_headers(response, request_id, include_s3_id=True, wildcard_cors=not AUTH)
     if response := await _handle_alb_request(host, path, method, headers, body, query_params):
         return _with_data_plane_headers(response, request_id)
     return None
@@ -3098,12 +3124,19 @@ async def _dispatch_service_request(
 
     _maybe_record_cloudtrail(service, method, path, headers, body, query_params, request_id, region)
 
+    cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "*",
+    }
+    if AUTH and service == "s3":
+        # Under AUTH only the bucket's CORS configuration adds CORS headers.
+        target = _s3_cors_target(headers.get("host", ""), path)
+        cors = _get_module("s3").cors_response_headers(target[0], method, headers) if target else {}
     resp_headers.update(
         {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Expose-Headers": "*",
+            **cors,
             "x-amzn-requestid": request_id,
             "x-amz-request-id": request_id,
             "x-amz-id-2": base64.b64encode(os.urandom(48)).decode(),
