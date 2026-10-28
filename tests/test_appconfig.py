@@ -1585,6 +1585,26 @@ _UUID0 = "00000000-0000-0000-0000-000000000000"
 _REQUEST_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
 
+def _delete_application(ac, app):
+    """Delete an application with everything under it, so later tests that list
+    applications aren't pushed off the first page."""
+    for env in ac.list_environments(ApplicationId=app)["Items"]:
+        for d in ac.list_deployments(ApplicationId=app, EnvironmentId=env["Id"])["Items"]:
+            if d["State"] in ("DEPLOYING", "BAKING"):
+                try:
+                    ac.stop_deployment(ApplicationId=app, EnvironmentId=env["Id"], DeploymentNumber=d["DeploymentNumber"])
+                except ClientError:
+                    pass
+        ac.delete_environment(ApplicationId=app, EnvironmentId=env["Id"])
+    for profile in ac.list_configuration_profiles(ApplicationId=app)["Items"]:
+        for version in ac.list_hosted_configuration_versions(
+                ApplicationId=app, ConfigurationProfileId=profile["Id"])["Items"]:
+            ac.delete_hosted_configuration_version(ApplicationId=app, ConfigurationProfileId=profile["Id"],
+                                                   VersionNumber=version["VersionNumber"])
+        ac.delete_configuration_profile(ApplicationId=app, ConfigurationProfileId=profile["Id"])
+    ac.delete_application(ApplicationId=app)
+
+
 class _SecretTarget:
     """An application with an instant strategy, a slow one, and helpers that
     make a profile per secret, as the capture runs did."""
@@ -1614,6 +1634,13 @@ class _SecretTarget:
                 self.sm.delete_secret(SecretId=arn, ForceDeleteWithoutRecovery=True)
             except ClientError:
                 pass
+        _delete_application(self.ac, self.app)
+        for strategy in self.ac.list_deployment_strategies()["Items"]:
+            if strategy["Name"].startswith(self.name):
+                try:
+                    self.ac.delete_deployment_strategy(DeploymentStrategyId=strategy["Id"])
+                except ClientError:
+                    pass
 
     def env(self):
         self._n += 1
@@ -2733,10 +2760,13 @@ def test_null_location_uri_profile_deploys_as_before(appconfig_client):
                                  headers={"Content-Type": "application/json",
                                           "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/appconfig/aws4_request, SignedHeaders=host, Signature=x"})
     profile = json.loads(urllib.request.urlopen(req).read())["Id"]
-    deployment = appconfig_client.start_deployment(
-        ApplicationId=app, EnvironmentId=env, ConfigurationProfileId=profile,
-        DeploymentStrategyId="AppConfig.AllAtOnce", ConfigurationVersion="1")
-    assert deployment["ConfigurationLocationUri"] == "hosted"
+    try:
+        deployment = appconfig_client.start_deployment(
+            ApplicationId=app, EnvironmentId=env, ConfigurationProfileId=profile,
+            DeploymentStrategyId="AppConfig.AllAtOnce", ConfigurationVersion="1")
+        assert deployment["ConfigurationLocationUri"] == "hosted"
+    finally:
+        _delete_application(appconfig_client, app)
 
 
 @pytest.mark.parametrize("value,content_type", [
