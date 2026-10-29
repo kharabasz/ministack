@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EventBridge Scheduler — `EventBridgeParameters` are validated and an event bus target publishes as AWS does** — `CreateSchedule` and `UpdateSchedule` accepted any `Target.EventBridgeParameters`; they now answer AWS's `SerializationException` for parameters or members sent as the wrong JSON type, then AWS's aggregated `ValidationException` for a missing or empty `DetailType` or `Source`, a `DetailType` over 128 or a `Source` over 256 characters, and a `Source` outside AWS's pattern (such as one starting with `aws.` or holding a line break), before the schedule or group is looked up and for any target type. An event a schedule puts on an event bus now has empty `resources` instead of the schedule ARN, and an event bus target without `EventBridgeParameters` no longer publishes an `aws.scheduler` event. Contributed by @kharabasz.
+
 ## [1.5.34] — 2026-10-29
 
 ### Added
