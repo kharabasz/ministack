@@ -105,6 +105,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "s3files": "s3",
     "s3tables": "s3tables",
     "scheduler": "scheduler",
+    "schemas": "schemas",
     "secretsmanager": "secretsmanager",
     "servicediscovery": "servicediscovery",
     "ses": "ses",
@@ -573,6 +574,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "s3files": [],  # uses S3 namespace but different paths
     "s3tables": ["s3tables"],
     "scheduler": ["scheduler"],
+    "schemas": ["schemas"],
     "ses": ["sesv2"],  # the v2 REST API; v1 names its Action
     "signer": ["signer"],
 }
@@ -1610,6 +1612,23 @@ def extract_resource_arn(service: str, method: str, path: str,
             gi = parts.index("schedule-groups")
             if gi + 1 < len(parts):
                 return f"arn:aws:scheduler:{region}:{account_id}:schedule-group/{parts[gi + 1]}"
+        return "*"
+
+    if service == "schemas":
+        # Resource types from the Service Authorization Reference:
+        # registry/{RegistryName} and schema/{RegistryName}/{SchemaName}.
+        # ListSchemas requires a schema resource; the registry's schemas
+        # are authorized as schema/{RegistryName}/*.
+        if path.startswith("/tags/"):
+            return unquote(path[len("/tags/"):]) or "*"
+        m = re.match(r"^/v1/registries/name/([^/]+)(?:/schemas(?:/name/([^/]+))?)?(?:/versions)?/?$", path)
+        if m:
+            registry, schema = m.group(1), m.group(2)
+            if schema:
+                return f"arn:aws:schemas:{region}:{account_id}:schema/{registry}/{schema}"
+            if path.rstrip("/").endswith("/schemas"):
+                return f"arn:aws:schemas:{region}:{account_id}:schema/{registry}/*"
+            return f"arn:aws:schemas:{region}:{account_id}:registry/{registry}"
         return "*"
 
     if service == "pipes":

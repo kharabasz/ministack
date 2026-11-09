@@ -312,6 +312,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **IAM — trust policies with `NotPrincipal`** — `CreateRole`, `UpdateAssumeRolePolicy` and `AWS::IAM::Role` stored them; they now answer `MalformedPolicyDocument` (`Allow with NotPrincipal is not allowed.`, `AssumeRole policy must not contain NotPrincipal field.`). Contributed by @iot-rocket.
 - **CloudTrail — `RecursiveLogging` on trails** — `CreateTrail` and `UpdateTrail` ignored it; trails now store it (default `true`, kept by an `UpdateTrail` without it) and return it from every trail response. Contributed by @iot-rocket.
 - **CloudFormation — callback URLs under `USE_SSL=1`** — the custom resource `ResponseURL` and the `WaitConditionHandle` URL were always `http://`, which the TLS-only gateway drops, so a handler's `urllib` PUT never arrived and the stack waited out `ServiceTimeout`; both are now `https://` when `USE_SSL` is on, and MiniStack's Lambdas get `SSL_CERT_FILE` set to the gateway's CA bundle, which Python's `ssl` reads. Contributed by @iot-rocket.
+### Added
+- **EventBridge Schemas — registries and schemas** — new `schemas` service for Terraform's `aws_schemas_registry` and `aws_schemas_schema`: registries and versioned `OpenApi3` / `JSONSchemaDraft4` schemas (create, describe, describe a version, update, delete, list, list versions) and tags, per account and region. `UpdateSchema` adds a version when the content or type changes, deleting a registry deletes its schemas, list calls take name prefixes and `Limit`/`NextToken`, and requests map to `schemas:*` IAM actions under `AUTH=true`. No discovery, code bindings, resource policies or search. Contributed by @kharabasz.
 
 ## [1.5.29] — 2026-10-17
 
