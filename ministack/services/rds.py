@@ -5050,6 +5050,34 @@ def _unregister_instance_from_clusters(db_id):
 # DB Instances
 # ---------------------------------------------------------------------------
 
+_cluster_member_create_locks = {}
+_cluster_member_create_locks_guard = threading.Lock()
+
+
+def _cluster_member_create_lock(cluster):
+    """One lock per cluster, held for a whole CreateDBInstance into that cluster.
+
+    Handlers run on worker threads, so two CreateDBInstance calls for one cluster
+    (Terraform creates `count = 2` cluster instances at the same moment) can
+    interleave. Each would see a cluster with no members and no shared
+    container, both would start the cluster's container under the same name,
+    and the one that loses the Docker name conflict reports `failed` until the
+    other's container is ready. Run them one after another instead, so the
+    second sees the first as a member, the same as when the calls arrive apart.
+
+    Unlike ``resource_lock`` this is held across Docker calls. That is safe
+    here: the section only creates database containers, which never call back
+    into MiniStack; image pulls and readiness waits already run on background
+    threads; and nothing else takes this lock, so it cannot join a cycle.
+
+    Keyed by the cluster ARN (account, region and id) and kept for the process
+    lifetime, like ``resource_lock``.
+    """
+    key = cluster.get("DBClusterArn") or id(cluster)
+    with _cluster_member_create_locks_guard:
+        return _cluster_member_create_locks.setdefault(key, threading.Lock())
+
+
 def _create_db_instance(p):
     cluster = None
     cluster_id = _p(p, "DBClusterIdentifier")
@@ -5057,6 +5085,9 @@ def _create_db_instance(p):
     if cluster and (switch_error := _begin_mysql_global_instance_mutation(cluster)):
         return switch_error
     try:
+        if cluster:
+            with _cluster_member_create_lock(cluster):
+                return _create_db_instance_impl(p)
         return _create_db_instance_impl(p)
     finally:
         if cluster:
@@ -5195,8 +5226,9 @@ def _create_db_instance_impl(p):
         pending_rotation = parent.get("_pending_master_password_rotation")
         if pending_rotation:
             readiness_master_pass = pending_rotation["old_password"]
-        # RDS action dispatch is synchronous and await-free, so this check and
-        # the shared metadata update cannot interleave with another create.
+        # _create_db_instance holds this cluster's member-create lock, so this
+        # check and the shared metadata update cannot interleave with another
+        # create into the same cluster.
         resume_control_plane_only = (
             not docker_client
             and not parent.get("DBClusterMembers")
