@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — Aurora cluster instances created at the same time** — two `CreateDBInstance` calls into one new cluster (Terraform's `count = 2`) both started the cluster's container, and the one that lost the Docker name conflict reported `failed` for about a second, which stops the AWS provider's create waiter. Creates into the same cluster now run one after another. Contributed by @kharabasz.
+
 ## [1.5.39] — 2026-11-08
 
 ### Added
