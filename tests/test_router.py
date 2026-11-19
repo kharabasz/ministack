@@ -225,6 +225,7 @@ _TOKEN_ROUTES = {
     "pipes": "pipes", "rds": "rds", "rds-data": "rds-data",
     "resource-groups": "resource-groups", "route53": "route53", "s3": "s3",
     "s3files": "s3files", "s3tables": "s3tables", "scheduler": "scheduler",
+    "schemas": "schemas",
     "secretsmanager": "secretsmanager", "servicediscovery": "servicediscovery",
     "sns": "sns", "sqs": "sqs", "ssm": "ssm", "states": "states", "sts": "sts",
     "tagging": "tagging", "transfer": "transfer", "waf": "waf", "wafv2": "wafv2",
@@ -423,6 +424,20 @@ def test_signer_credential_scope_routes():
     assert detect_service(
         "GET", "/signing-profiles/prof1", _sigv4_headers("signer"), {}
     ) == "signer"
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/v1/registries"),
+    ("POST", "/v1/registries/name/reg"),
+    ("GET", "/v1/registries/name/reg/schemas/name/orders.created/versions"),
+    ("GET", "/tags/arn:aws:schemas:us-east-1:000000000000:schema/reg/orders.created"),
+    ("DELETE", "/tags/arn%3Aaws%3Aschemas%3Aus-east-1%3A000000000000%3Aregistry%2Freg"),
+])
+def test_schemas_credential_scope_and_host_route(method, path):
+    """boto3 signs EventBridge Schemas with scope `schemas`; the /tags/{arn}
+    routes have no path prefix of their own, so the scope must resolve them."""
+    assert detect_service(method, path, _sigv4_headers("schemas"), {}) == "schemas"
+    assert detect_service(method, path, {"host": "schemas.us-east-1.localhost:4566"}, {}) == "schemas"
 
 
 def test_signer_host_routes():
