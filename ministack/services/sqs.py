@@ -641,6 +641,7 @@ def queue_delay(q: dict) -> int:
 def _act_send_message(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:SendMessage")
+    _check_queue_key(q)
 
     body_text = data.get("MessageBody", "")
     if not body_text:
@@ -764,6 +765,7 @@ def _act_send_message(data: dict, qurl: str) -> dict:
 async def _act_receive_message(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:ReceiveMessage")
+    _check_queue_key(q)
 
     max_n = int(data.get("MaxNumberOfMessages", 1))
     if not 1 <= max_n <= 10:
@@ -1252,6 +1254,15 @@ def _get_q(url: str, action: str | None = None) -> dict:
     return q
 
 
+def _check_queue_key(q: dict) -> None:
+    from ministack.services import kms
+    key_ref = q["attributes"].get("KmsMasterKeyId")
+    if key_ref and kms.held_key_state(key_ref) == "Disabled":
+        raise _Err("KmsDisabled",
+                   f"{kms.key_arn_for_request(key_ref)} is disabled. (Service: AWSKMS; Status Code: 400; "
+                   f"Error Code: DisabledException; Request ID: {new_uuid()}; Proxy: null)")
+
+
 def _ensure_msg_fields(m: dict) -> None:
     """Ensure internal message shape for ReceiveMessage (SNS fan-out etc.)."""
     if "md5_body" not in m and m.get("md5"):
@@ -1570,7 +1581,7 @@ _QUERY_COMPAT_CODES: dict[str, str] = {
     "ResourceNotFoundException":      "ResourceNotFoundException",
     # KMS errors — no namespace prefix
     "KmsAccessDenied":                "KmsAccessDenied",
-    "KmsDisabled":                    "KmsDisabled",
+    "KmsDisabled":                    "KMS.DisabledException",
     "KmsInvalidKeyUsage":             "KmsInvalidKeyUsage",
     "KmsInvalidState":                "KmsInvalidState",
     "KmsNotFound":                    "KmsNotFound",
