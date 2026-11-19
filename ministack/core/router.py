@@ -443,6 +443,10 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"rds-data\."],
         "credential_scope": "rds-data",
     },
+    "vpc-lattice": {
+        "host_patterns": [r"vpc-lattice\."],
+        "credential_scope": "vpc-lattice",
+    },
     "autoscaling": {
         "host_patterns": [r"autoscaling\."],
         "credential_scope": "autoscaling",
@@ -866,6 +870,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "application-autoscaling": "application-autoscaling",
                 "s3files": "s3files",
                 "rds-data": "rds-data",
+                "vpc-lattice": "vpc-lattice",
                 "autoscaling": "autoscaling",
                 "appconfig": "appconfig",
                 "appconfigdata": "appconfigdata",
