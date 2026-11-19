@@ -1266,6 +1266,55 @@ def test_secretsmanager_kms_key_id_on_update(sm):
     assert resp["KmsKeyId"] == "alias/other-key"
 
 
+def test_secretsmanager_kms_key_disabled_or_pending_deletion(sm, kms_client):
+    key = kms_client.create_key(Description="sm-key-state")["KeyMetadata"]["Arn"]
+    name = f"sm-key-state-{_uuid_mod.uuid4().hex[:8]}"
+    sm.create_secret(Name=name, KmsKeyId=key, SecretString="v0")
+
+    def error(fn, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            fn(**kwargs)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    def kms_suffix(code):
+        return f" (Service: AWSKMS; Status Code: 400; Error Code: {code}; Request ID: "
+
+    try:
+        kms_client.disable_key(KeyId=key)
+        code, message = error(sm.get_secret_value, SecretId=name)
+        assert code == "DecryptionFailure"
+        assert message.startswith(f"Secrets Manager can't decrypt the secret value: {key} is disabled."
+                                  + kms_suffix("DisabledException"))
+        code, message = error(sm.put_secret_value, SecretId=name, SecretString="v1")
+        assert code == "EncryptionFailure"
+        assert message.startswith(f"Secrets Manager can't encrypt the secret value: {key} is disabled."
+                                  + kms_suffix("DisabledException"))
+        assert error(sm.create_secret, Name=name + "-d", KmsKeyId=key, SecretString="v") == (
+            "InvalidParameterException", "The operation failed because the specified KMS key is disabled.")
+
+        kms_client.enable_key(KeyId=key)
+        assert sm.get_secret_value(SecretId=name)["SecretString"] == "v0"
+
+        kms_client.schedule_key_deletion(KeyId=key, PendingWindowInDays=7)
+        code, message = error(sm.get_secret_value, SecretId=name)
+        assert code == "DecryptionFailure"
+        assert message.startswith(f"Secrets Manager can't decrypt the secret value: {key} is pending deletion."
+                                  + kms_suffix("KMSInvalidStateException"))
+        code, message = error(sm.put_secret_value, SecretId=name, SecretString="v2")
+        assert code == "EncryptionFailure"
+        assert message.startswith(f"Secrets Manager can't encrypt the secret value: {key} is pending deletion."
+                                  + kms_suffix("KMSInvalidStateException"))
+        code, message = error(sm.create_secret, Name=name + "-p", KmsKeyId=key, SecretString="v")
+        assert code == "PreconditionNotMetException"
+        assert message.startswith(f"{key} is pending deletion." + kms_suffix("KMSInvalidStateException"))
+        assert message.endswith("; Proxy: null)")
+    finally:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+        if kms_client.describe_key(KeyId=key)["KeyMetadata"]["KeyState"] != "PendingDeletion":
+            kms_client.schedule_key_deletion(KeyId=key, PendingWindowInDays=7)
+
+
 def test_secretsmanager_get_by_partial_arn(sm):
     """GetSecretValue with a partial ARN (no random suffix) must resolve the secret."""
     import uuid as _uuid
