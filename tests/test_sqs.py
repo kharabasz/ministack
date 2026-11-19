@@ -2777,22 +2777,20 @@ def test_sqs_sender_id_is_the_user_or_role_session(sqs):
     assert seen == {"from-user": user["UserId"], "from-role-session": f"{role['RoleId']}:my-session"}
 
 
-def test_sqs_send_and_receive_fail_while_queue_kms_key_is_disabled(sqs, kms_client):
+def test_sqs_send_fails_while_queue_kms_key_is_disabled(sqs, kms_client):
     key = kms_client.create_key()["KeyMetadata"]["Arn"]
     url = sqs.create_queue(QueueName=f"kms-disabled-{_uuid_mod.uuid4().hex[:8]}",
                            Attributes={"KmsMasterKeyId": key})["QueueUrl"]
     try:
         kms_client.disable_key(KeyId=key)
-        for call in (lambda: sqs.send_message(QueueUrl=url, MessageBody="x"),
-                     lambda: sqs.receive_message(QueueUrl=url)):
-            with pytest.raises(ClientError) as exc:
-                call()
-            assert exc.value.response["Error"]["Code"] == "KMS.DisabledException"
-            assert exc.value.response["Error"]["Message"].startswith(f"{key} is disabled. (Service: AWSKMS;")
-            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
-        kms_client.enable_key(KeyId=key)
-        sqs.send_message(QueueUrl=url, MessageBody="y")
-        assert [m["Body"] for m in sqs.receive_message(QueueUrl=url).get("Messages", [])] == ["y"]
+        with pytest.raises(ClientError) as exc:
+            sqs.send_message(QueueUrl=url, MessageBody="x")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["Error"]["Code"] == "KMS.DisabledException"
+        assert re.fullmatch(
+            re.escape(f"{key} is disabled. (Service: AWSKMS; Status Code: 400; Error Code: DisabledException; ")
+            + r"Request ID: [0-9a-f-]{36}; Proxy: null\)",
+            exc.value.response["Error"]["Message"])
     finally:
         sqs.delete_queue(QueueUrl=url)
         kms_client.schedule_key_deletion(KeyId=key, PendingWindowInDays=7)

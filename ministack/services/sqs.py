@@ -765,7 +765,6 @@ def _act_send_message(data: dict, qurl: str) -> dict:
 async def _act_receive_message(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:ReceiveMessage")
-    _check_queue_key(q)
 
     max_n = int(data.get("MaxNumberOfMessages", 1))
     if not 1 <= max_n <= 10:
