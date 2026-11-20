@@ -641,7 +641,6 @@ def queue_delay(q: dict) -> int:
 def _act_send_message(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:SendMessage")
-    _check_queue_key(q)
 
     body_text = data.get("MessageBody", "")
     if not body_text:
@@ -666,6 +665,7 @@ def _act_send_message(data: dict, qurl: str) -> dict:
             "InvalidParameterValue",
             f"One or more parameters are invalid. Reason: Message must be shorter than {max_size} bytes.",
         )
+    _check_queue_key(q)
 
     # A per-message DelaySeconds overrides the queue's; FIFO queues accept
     # only 0 and keep the queue-level delay (real AWS, ap-south-1).

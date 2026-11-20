@@ -2784,6 +2784,9 @@ def test_sqs_send_fails_while_queue_kms_key_is_disabled(sqs, kms_client):
     try:
         kms_client.disable_key(KeyId=key)
         with pytest.raises(ClientError) as exc:
+            sqs.send_message(QueueUrl=url, MessageBody="")
+        assert exc.value.response["Error"]["Code"] == "MissingParameter"
+        with pytest.raises(ClientError) as exc:
             sqs.send_message(QueueUrl=url, MessageBody="x")
         assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
         assert exc.value.response["Error"]["Code"] == "KMS.DisabledException"
