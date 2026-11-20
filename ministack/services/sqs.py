@@ -665,7 +665,6 @@ def _act_send_message(data: dict, qurl: str) -> dict:
             "InvalidParameterValue",
             f"One or more parameters are invalid. Reason: Message must be shorter than {max_size} bytes.",
         )
-    _check_queue_key(q)
 
     # A per-message DelaySeconds overrides the queue's; FIFO queues accept
     # only 0 and keep the queue-level delay (real AWS, ap-south-1).
@@ -696,6 +695,8 @@ def _act_send_message(data: dict, qurl: str) -> dict:
                 raise _Err("InvalidParameterValue",
                             "The queue should either have ContentBasedDeduplication "
                             "enabled or MessageDeduplicationId provided explicitly.")
+    _check_queue_key(q)
+    if q["is_fifo"]:
         # When DeduplicationScope=messageGroup the dedup window is per message
         # group; two messages with the same body but different group IDs are
         # distinct and must both be enqueued.  Scope the cache key accordingly.
@@ -1119,7 +1120,7 @@ def _act_send_message_batch(data: dict, qurl: str) -> dict:
             r["Id"] = e.get("Id", "")
             ok.append(r)
         except _Err as ex:
-            fail.append({"Id": e.get("Id", ""), "Code": ex.code,
+            fail.append({"Id": e.get("Id", ""), "Code": _QUERY_COMPAT_CODES.get(ex.code, ex.code),
                          "Message": ex.message, "SenderFault": True})
     return {"Successful": ok, "Failed": fail}
 

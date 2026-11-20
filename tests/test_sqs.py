@@ -2779,10 +2779,22 @@ def test_sqs_sender_id_is_the_user_or_role_session(sqs):
 
 def test_sqs_send_fails_while_queue_kms_key_is_disabled(sqs, kms_client):
     key = kms_client.create_key()["KeyMetadata"]["Arn"]
-    url = sqs.create_queue(QueueName=f"kms-disabled-{_uuid_mod.uuid4().hex[:8]}",
-                           Attributes={"KmsMasterKeyId": key})["QueueUrl"]
+    suffix = _uuid_mod.uuid4().hex[:8]
+    url = sqs.create_queue(QueueName=f"kms-disabled-{suffix}", Attributes={"KmsMasterKeyId": key})["QueueUrl"]
+    fifo = sqs.create_queue(QueueName=f"kms-disabled-{suffix}.fifo",
+                            Attributes={"KmsMasterKeyId": key, "FifoQueue": "true"})["QueueUrl"]
     try:
         kms_client.disable_key(KeyId=key)
+        with pytest.raises(ClientError) as exc:
+            sqs.send_message(QueueUrl=fifo, MessageBody="x", MessageDeduplicationId="d")
+        assert exc.value.response["Error"]["Code"] == "MissingParameter"
+        with pytest.raises(ClientError) as exc:
+            sqs.send_message(QueueUrl=fifo, MessageBody="x", MessageGroupId="g", MessageDeduplicationId="d")
+        assert exc.value.response["Error"]["Code"] == "KMS.DisabledException"
+        batch = sqs.send_message_batch(QueueUrl=url, Entries=[{"Id": "a", "MessageBody": "one"}])
+        assert batch.get("Successful", []) == []
+        assert [(f["Id"], f["Code"], f["SenderFault"]) for f in batch["Failed"]] == [
+            ("a", "KMS.DisabledException", True)]
         with pytest.raises(ClientError) as exc:
             sqs.send_message(QueueUrl=url, MessageBody="")
         assert exc.value.response["Error"]["Code"] == "MissingParameter"
@@ -2796,4 +2808,5 @@ def test_sqs_send_fails_while_queue_kms_key_is_disabled(sqs, kms_client):
             exc.value.response["Error"]["Message"])
     finally:
         sqs.delete_queue(QueueUrl=url)
+        sqs.delete_queue(QueueUrl=fifo)
         kms_client.schedule_key_deletion(KeyId=key, PendingWindowInDays=7)
