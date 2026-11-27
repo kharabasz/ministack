@@ -3782,6 +3782,14 @@ def create_load_balancer_interfaces(description, interface_type, subnet_ids, sg_
         }
 
 
+def load_balancer_interface_description(private_ip):
+    """Description of the load balancer interface holding `private_ip`, or None. Called by alb."""
+    for eni in _network_interfaces.values():
+        if eni["PrivateIpAddress"] == private_ip and eni["Description"].startswith("ELB "):
+            return eni["Description"]
+    return None
+
+
 def delete_load_balancer_interfaces(description):
     for eni_id in [k for k, eni in _network_interfaces.items() if eni["Description"] == description]:
         del _network_interfaces[eni_id]

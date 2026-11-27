@@ -3853,3 +3853,31 @@ def test_elbv2_load_balancer_network_interfaces(elbv2, ec2):
         for subnet in subnets:
             ec2.delete_subnet(SubnetId=subnet)
         ec2.delete_vpc(VpcId=vpc)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_forward_through_network_load_balancer_address(elbv2, ec2):
+    """An ip target that is a Network Load Balancer's own address is reached through that load balancer's
+    listener and target group (AWS capture). The emulator's health endpoint is the backend."""
+    import urllib.request as _req
+
+    subnet = ec2.describe_subnets()["Subnets"][0]["SubnetId"]
+    nlb_arn = elbv2.create_load_balancer(
+        Name="dp-nlb-hop", Type="network", Scheme="internal", Subnets=[subnet])["LoadBalancers"][0]["LoadBalancerArn"]
+    nlb_tg_arn = elbv2.create_target_group(
+        Name="dp-nlb-hop-tg", Protocol="TCP", Port=8000, VpcId="vpc-00000001",
+        TargetType="ip")["TargetGroups"][0]["TargetGroupArn"]
+    elbv2.register_targets(TargetGroupArn=nlb_tg_arn, Targets=[{"Id": "127.0.0.1", "Port": _SERVER_GATEWAY_PORT}])
+    nlb_l_arn = elbv2.create_listener(
+        LoadBalancerArn=nlb_arn, Protocol="TCP", Port=8000,
+        DefaultActions=[{"Type": "forward", "TargetGroupArn": nlb_tg_arn}])["Listeners"][0]["ListenerArn"]
+    (eni,) = ec2.describe_network_interfaces(Filters=[
+        {"Name": "description", "Values": ["ELB " + nlb_arn.split(":loadbalancer/")[1]]}])["NetworkInterfaces"]
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, "dp-alb-hop", eni["PrivateIpAddress"], 8000)
+    try:
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/dp-alb-hop/_ministack/health", method="GET"))
+        assert resp.status == 200
+        assert "services" in json.loads(resp.read())
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _alb_http_target_teardown(elbv2, nlb_arn, nlb_tg_arn, nlb_l_arn)
