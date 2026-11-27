@@ -4861,3 +4861,27 @@ def test_ecs_task_gets_the_relative_credentials_uri_when_the_address_is_served()
         "arn:aws:ecs:us-east-1:000000000000:cluster/c", None, endpoint)
     assert kwargs["network"] == "net1"
     assert kwargs["networking_config"] == {"net1": endpoint}
+
+
+@pytest.mark.data_plane
+def test_ecs_container_runs_the_task_definitions_entry_point(ecs):
+    """A container definition's entryPoint replaces the image's: the shell named there runs the
+    command as its script (AWS capture of a running service defined this way)."""
+    cluster = f"entrypoint-{_uuid_mod.uuid4().hex[:8]}"
+    family = f"entrypoint-{_uuid_mod.uuid4().hex[:8]}"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(family=family, containerDefinitions=[{
+        "name": "app", "image": "busybox", "memory": 64, "essential": True,
+        "entryPoint": ["/bin/sh", "-c"], "command": ["echo started\nexit 3\n"]}])
+    task_arn = ecs.run_task(cluster=cluster, taskDefinition=family)["tasks"][0]["taskArn"]
+    try:
+        for _ in range(60):
+            task = ecs.describe_tasks(cluster=cluster, tasks=[task_arn])["tasks"][0]
+            if task["lastStatus"] == "STOPPED":
+                break
+            time.sleep(1)
+        assert task["lastStatus"] == "STOPPED"
+        assert task["containers"][0]["exitCode"] == 3
+    finally:
+        ecs.deregister_task_definition(taskDefinition=f"{family}:1")
+        ecs.delete_cluster(cluster=cluster)
