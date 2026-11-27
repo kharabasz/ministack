@@ -1034,6 +1034,23 @@ def test_secretsmanager_put_secret_value_stages(sm):
     previous = sm.get_secret_value(SecretId="qa-sm-stages", VersionStage="AWSPREVIOUS")
     assert previous["SecretString"] == "v2"
 
+def test_secretsmanager_first_version_with_custom_stage_is_current(sm):
+    """The first version of a secret gets AWSCURRENT even when PutSecretValue names a custom label only."""
+    sm.create_secret(Name="qa-sm-first-custom-stage")
+    first = sm.put_secret_value(
+        SecretId="qa-sm-first-custom-stage", SecretString="placeholder", VersionStages=["MANAGED_PLACEHOLDER"],
+    )
+    assert first["VersionStages"] == ["AWSCURRENT", "MANAGED_PLACEHOLDER"]
+    current = sm.get_secret_value(SecretId="qa-sm-first-custom-stage")
+    assert current["VersionId"] == first["VersionId"]
+    assert current["SecretString"] == "placeholder"
+
+    second = sm.put_secret_value(
+        SecretId="qa-sm-first-custom-stage", SecretString="other", VersionStages=["OTHER_LABEL"],
+    )
+    assert second["VersionStages"] == ["OTHER_LABEL"]
+    assert sm.get_secret_value(SecretId="qa-sm-first-custom-stage")["SecretString"] == "placeholder"
+
 def test_secretsmanager_list_secret_version_ids(sm):
     """ListSecretVersionIds returns all versions."""
     sm.create_secret(Name="qa-sm-versions", SecretString="initial")
