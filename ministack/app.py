@@ -583,6 +583,9 @@ def _resolve_port():
     return os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
 
 
+_ECS_CREDENTIALS_ADDRESS = "169.254.170.2"
+
+
 def _port_is_bindable(host: str, port: int) -> bool:
     """Whether `port` can be opened here: free, and permitted to this process."""
     import socket as _socket
@@ -4281,6 +4284,12 @@ def main():
             # A Cognito token's `iss` is https with no port, so clients ask 443.
             if port != "443" and _port_is_bindable(bind_host, 443):
                 config.bind.append(f"{bind_host}:443")
+
+        # ECS tasks read their role's credentials from http://169.254.170.2 plus
+        # AWS_CONTAINER_CREDENTIALS_RELATIVE_URI. Serve that address when this host has it
+        # (a container run with --link-local-ip 169.254.170.2): ECS then points tasks at it.
+        if _port_is_bindable(_ECS_CREDENTIALS_ADDRESS, 80):
+            (config.insecure_bind if _tls.use_ssl_enabled() else config.bind).append(f"{_ECS_CREDENTIALS_ADDRESS}:80")
 
         try:
             asyncio.run(hypercorn_serve(app, config))

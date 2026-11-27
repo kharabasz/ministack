@@ -4832,3 +4832,32 @@ def test_ecs_awsvpc_task_containers_share_the_network_interface(ecs):
     finally:
         ecs.deregister_task_definition(taskDefinition=f"{family}:1")
         ecs.delete_cluster(cluster=cluster)
+
+
+def test_ecs_task_gets_the_relative_credentials_uri_when_the_address_is_served():
+    """A task is pointed at 169.254.170.2 only when Ministack answers there: it gets
+    AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, the path of its full credentials URI, and its
+    container an endpoint with a link-local address."""
+    from ministack.services import ecs as ecs_service
+
+    def env_for(credentials_address):
+        env = {}
+        ecs_service._register_metadata(
+            "arn:aws:ecs:us-east-1:000000000000:task/c/task1234",
+            "arn:aws:ecs:us-east-1:000000000000:cluster/c",
+            {"family": "f"}, {"name": "app", "image": "busybox:latest"}, "FARGATE", env,
+            False, "172.18.0.2", credentials_address)
+        return env
+
+    assert "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" not in env_for(False)
+    env = env_for(True)
+    assert env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"].startswith("/v2/credentials/")
+    assert env["AWS_CONTAINER_CREDENTIALS_FULL_URI"].endswith(env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"])
+
+    endpoint = {"IPAMConfig": {"LinkLocalIPs": ["169.254.171.5"]}}
+    kwargs = ecs_service._build_run_kwargs(
+        {"name": "app", "image": "busybox:latest"}, {"networkMode": "awsvpc"}, env, {}, "net1", False,
+        "task1234", "arn:aws:ecs:us-east-1:000000000000:task/c/task1234", "172.18.0.2",
+        "arn:aws:ecs:us-east-1:000000000000:cluster/c", None, endpoint)
+    assert kwargs["network"] == "net1"
+    assert kwargs["networking_config"] == {"net1": endpoint}
