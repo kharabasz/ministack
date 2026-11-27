@@ -1136,6 +1136,9 @@ def _put_secret_value(data):
     vid = data.get("ClientRequestToken", new_uuid())
     stages = data.get("VersionStages", ["AWSCURRENT"])
     now = int(time.time())
+    # The first version of a secret gets AWSCURRENT whatever VersionStages names (AWS capture).
+    _, current = _find_stage_version(secret, "AWSCURRENT")
+    first_version = not current or (current.get("SecretString") is None and current.get("SecretBinary") is None)
 
     secret["Versions"][vid] = {
         "SecretString": data.get("SecretString"),
@@ -1147,9 +1150,11 @@ def _put_secret_value(data):
     if "AWSCURRENT" in stages:
         _apply_current_promotion(secret, vid)
     else:
+        if first_version:
+            _apply_current_promotion(secret, vid)
         for _lbl in stages:
             _remove_stage_everywhere(secret, _lbl, except_version_id=vid)
-        secret["Versions"][vid]["Stages"] = list(stages)
+        secret["Versions"][vid]["Stages"] += stages
         for _lbl in stages:
             if _lbl not in ("AWSCURRENT", "AWSPENDING", "AWSPREVIOUS"):
                 _emit_secret_label_updated(secret, _lbl, vid)
