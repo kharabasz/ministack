@@ -2508,11 +2508,38 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_
 
     if target_type in ("instance", "ip"):
         target = random.choice(registered)
+        if target_type == "ip":
+            target = _network_load_balancer_target(target, tg) or target
         return await _proxy_http_target(target, tg, method, raw_path or path,
                                         headers, body, query_params, raw_query_string)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": f"Target type '{target_type}' not supported."}).encode())
+
+
+def _network_load_balancer_target(target, tg):
+    """The target behind a Network Load Balancer when `target` is one of that load balancer's addresses.
+
+    A target group can register a Network Load Balancer's network interface addresses as ip targets
+    (AWS capture). The connection then goes through the listener on the target's port to one of the
+    targets of its target group. Returns None when `target` is no such address.
+    """
+    from ministack.services import ec2
+
+    description = ec2.load_balancer_interface_description(str(target.get("Id", "")))
+    if not description or not description.startswith("ELB net/"):
+        return None
+    port = int(target.get("Port") or tg.get("Port") or 80)
+    for listener in _listeners.values():
+        if not listener["LoadBalancerArn"].endswith("/" + description[len("ELB "):]) or listener.get("Port") != port:
+            continue
+        for action in listener.get("DefaultActions", []):
+            behind_arn = _forward_target_group(action)
+            behind = _targets.get(behind_arn, [])
+            if behind:
+                chosen = random.choice(behind)
+                return {"Id": chosen["Id"], "Port": chosen.get("Port") or _tgs.get(behind_arn, {}).get("Port")}
+    return None
 
 
 async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, body, query_params, raw_query_string=None):
