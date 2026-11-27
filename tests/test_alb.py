@@ -3881,3 +3881,27 @@ def test_elbv2_dataplane_forward_through_network_load_balancer_address(elbv2, ec
     finally:
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
         _alb_http_target_teardown(elbv2, nlb_arn, nlb_tg_arn, nlb_l_arn)
+
+
+def test_elbv2_dataplane_applies_a_rules_url_rewrite(elbv2):
+    """A rule's url-rewrite transform changes the path the target receives and keeps the query string;
+    a request its regex does not match goes on unchanged (AWS capture of the rewritten path)."""
+    server = _start_echo_server()
+    lb_name = "dp-alb-rewrite"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    rule_arn = elbv2.create_rule(
+        ListenerArn=l_arn, Priority=10,
+        Conditions=[{"Field": "path-pattern", "Values": ["/app", "/app/*", "/other/*"]}],
+        Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+        Transforms=[_url_rewrite("^/app/?(.*)$", "/_spa/site/@/$1")])["Rules"][0]["RuleArn"]
+    try:
+        for sent, received in (("/app/js/main.js?v=1", "/_spa/site/@/js/main.js?v=1"),
+                               ("/app", "/_spa/site/@/"),
+                               ("/other/page", "/other/page"),
+                               ("/default", "/default")):
+            resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}{sent}"))
+            assert json.loads(resp.read())["path"] == received
+    finally:
+        elbv2.delete_rule(RuleArn=rule_arn)
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)

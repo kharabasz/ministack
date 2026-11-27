@@ -33,7 +33,7 @@ import string
 import time
 import warnings
 from email.utils import formatdate
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, unquote, urlencode
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -2916,6 +2916,8 @@ async def _dispatch_request(lb, method, path, headers, body, query_params, port,
         if matched:
             actions = rule.get("Actions") or listener.get("DefaultActions", [])
             if actions:
+                path, raw_path, query_params, raw_query_string = _url_rewritten(
+                    rule, path, raw_path, query_params, raw_query_string)
                 target_headers = _target_headers(lb_arn, listener, headers,
                                                  client_ip or get_request_client_ip())
                 target_host = target_headers.get("host")
@@ -2929,6 +2931,32 @@ async def _dispatch_request(lb, method, path, headers, body, query_params, port,
 
     return _with_alb_server((502, {"Content-Type": "application/json"},
             json.dumps({"message": "No matching ALB rule found"}).encode()), l_arn)
+
+
+def _url_rewritten(rule, path, raw_path, query_params, raw_query_string):
+    """The request's path and query string after the rule's url-rewrite transform.
+
+    The transform matches its regex against the request URL's path and query string and
+    replaces the match; `$1` in the replacement names a capture group. Without a match the
+    request goes on unchanged ("If there is no pattern match, the original request is sent
+    to the target").
+    """
+    rewrites = [rw for t in rule.get("Transforms") or [] if t.get("Type") == "url-rewrite"
+                for rw in (t.get("UrlRewriteConfig") or {}).get("Rewrites") or []]
+    if not rewrites:
+        return path, raw_path, query_params, raw_query_string
+    if raw_query_string is None:
+        raw_query_string = urlencode([(k, v) for k, vs in (query_params or {}).items()
+                                      for v in (vs if isinstance(vs, list) else [vs])])
+    url = (raw_path or path) + (f"?{raw_query_string}" if raw_query_string else "")
+    for rewrite in rewrites:
+        replace = re.sub(r"\$(\d+)", r"\\g<\1>", (rewrite.get("Replace") or "").replace("\\", "\\\\"))
+        try:
+            url = re.sub(rewrite.get("Regex") or "", replace, url, count=1)
+        except re.error:
+            pass
+    raw_path, _, raw_query_string = url.partition("?")
+    return unquote(raw_path), raw_path, parse_qs(raw_query_string, keep_blank_values=True), raw_query_string
 
 
 def reset():
