@@ -1724,8 +1724,12 @@ def _build_task_containers(td, container_overrides):
     return containers
 
 
+# Where ECS serves a task's role credentials (AWS_CONTAINER_CREDENTIALS_RELATIVE_URI is relative to it).
+_CREDENTIALS_ADDRESS = "169.254.170.2"
+
+
 def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
-                       host_mode, ministack_net_ip):
+                       host_mode, ministack_net_ip, credentials_address=False):
     """Inject ECS_CONTAINER_METADATA_URI_V4 into env and register the
     container with the metadata server. Returns the token so the caller can
     record it on the task and update DockerId once the container starts.
@@ -1733,6 +1737,9 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
     `ministack_net_ip` is Ministack's IP on the shared user-defined network
     (when discoverable). Using it directly is the only reliable address on
     Linux Docker; `host.docker.internal` is a Docker-Desktop-only fallback.
+
+    `credentials_address`: Ministack answers on 169.254.170.2, so the task also
+    gets AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, the variable ECS itself sets.
     """
     token = secrets.token_urlsafe(32)
     if host_mode:
@@ -1743,7 +1750,10 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
         host = "host.docker.internal"
     port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
     env["ECS_CONTAINER_METADATA_URI_V4"] = f"http://{host}:{port}/v4/{token}"
-    env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = f"http://{host}:{port}/v2/credentials/{new_uuid()}"
+    credentials_path = f"/v2/credentials/{new_uuid()}"
+    env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = f"http://{host}:{port}{credentials_path}"
+    if credentials_address:
+        env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] = credentials_path
     env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = secrets.token_urlsafe(32)
     env["AWS_ENDPOINT_URL"] = f"http://{host}:{port}"
     # Seeded from the record, not a literal: the task is not RUNNING yet here.
@@ -1815,7 +1825,7 @@ def _container_override_for(container_overrides, container_name):
 
 def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
                       host_mode, task_id, task_arn, ministack_net_ip,
-                      cluster_arn, network_container=None):
+                      cluster_arn, network_container=None, endpoint_config=None):
     """Build kwargs for docker_client.containers.run from a container
     definition + task definition (privileged, cap_add, pid_mode, networking,
     bind mounts).
@@ -1823,6 +1833,9 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
     `network_container` is the id of the awsvpc task's first container: the
     task has one network interface, so its other containers join that one's
     network (AWS capture: every container of a task names the same address).
+
+    `endpoint_config` is the container's Docker endpoint on `ecs_network`: it
+    carries the link-local address that lets the task reach 169.254.170.2.
     """
     lp = cdef.get("linuxParameters") or cdef.get("LinuxParameters") or {}
     caps = lp.get("Capabilities") or lp.get("capabilities") or {}
@@ -1870,6 +1883,8 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
         kwargs["network_mode"] = f"container:{network_container}"
     else:
         kwargs["network"] = ecs_network
+        if endpoint_config:
+            kwargs["networking_config"] = {ecs_network: endpoint_config}
         if not ministack_net_ip:
             # Docker-Desktop fallback: when we couldn't discover Ministack's
             # IP on the shared network, route via host.docker.internal.
@@ -2542,12 +2557,15 @@ def _start_task_worker(task, td, container_overrides, docker_client):
 
     ecs_network = None
     ministack_net_ip = None
+    credentials_address = False
     try:
         self_container = docker_client.containers.get(os.environ.get("HOSTNAME", ""))
         nets = self_container.attrs["NetworkSettings"]["Networks"]
         if nets:
             ecs_network = next(iter(nets))
             ministack_net_ip = nets[ecs_network].get("IPAddress") or None
+            credentials_address = _CREDENTIALS_ADDRESS in (
+                (nets[ecs_network].get("IPAMConfig") or {}).get("LinkLocalIPs") or [])
             logger.debug(
                 "ECS: detected Ministack network=%s ip=%s",
                 ecs_network, ministack_net_ip,
@@ -2597,7 +2615,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
         host_mode = td.get("networkMode") == "host"
         metadata_token = _register_metadata(
             task_arn, cluster_arn, td, cdef, launch_type, env,
-            host_mode, ministack_net_ip,
+            host_mode, ministack_net_ip, credentials_address,
         )
         with resource_lock("ecs-task", task_arn):
             active = _task_is_active(task_arn, task)
@@ -2612,6 +2630,10 @@ def _start_task_worker(task, td, container_overrides, docker_client):
             effective_cdef, td, env, port_bindings, ecs_network,
             host_mode, task_id, task_arn, ministack_net_ip, cluster_arn,
             network_container,
+            # Any link-local address puts 169.254.0.0/16 on the container's interface.
+            docker_client.api.create_endpoint_config(link_local_ips=[
+                f"169.254.{171 + secrets.randbelow(84)}.{1 + secrets.randbelow(254)}"])
+            if credentials_address else None,
         )
 
         with resource_lock("ecs-task", task_arn):
