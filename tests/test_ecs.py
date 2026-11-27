@@ -4799,3 +4799,27 @@ def test_pinned_platform_pull_failure_says_the_pull_failed(caplog):
         ecs_service._run_docker_container(daemon, cdef, {"platform": "linux/arm64"})
     assert "pulling quay.io/permitio/pdp-v2:0.9.9 for linux/arm64 failed" in caplog.text
     assert "this host cannot run it" not in caplog.text
+
+
+@pytest.mark.data_plane
+def test_ecs_container_runs_the_task_definitions_entry_point(ecs):
+    """A container definition's entryPoint replaces the image's: the shell named there runs the
+    command as its script (AWS capture of a running service defined this way)."""
+    cluster = f"entrypoint-{_uuid_mod.uuid4().hex[:8]}"
+    family = f"entrypoint-{_uuid_mod.uuid4().hex[:8]}"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(family=family, containerDefinitions=[{
+        "name": "app", "image": "busybox", "memory": 64, "essential": True,
+        "entryPoint": ["/bin/sh", "-c"], "command": ["echo started\nexit 3\n"]}])
+    task_arn = ecs.run_task(cluster=cluster, taskDefinition=family)["tasks"][0]["taskArn"]
+    try:
+        for _ in range(60):
+            task = ecs.describe_tasks(cluster=cluster, tasks=[task_arn])["tasks"][0]
+            if task["lastStatus"] == "STOPPED":
+                break
+            time.sleep(1)
+        assert task["lastStatus"] == "STOPPED"
+        assert task["containers"][0]["exitCode"] == 3
+    finally:
+        ecs.deregister_task_definition(taskDefinition=f"{family}:1")
+        ecs.delete_cluster(cluster=cluster)

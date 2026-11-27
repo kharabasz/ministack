@@ -1854,6 +1854,8 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
         command=cdef.get("command"),
         privileged=bool(cdef.get("privileged") or cdef.get("Privileged")),
     )
+    if cdef.get("entryPoint"):
+        kwargs["entrypoint"] = cdef["entryPoint"]
     if binds:
         kwargs["volumes"] = binds
     if cap_add:
