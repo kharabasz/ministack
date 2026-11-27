@@ -937,6 +937,10 @@ def _rule_xml(r, with_transforms=True):
 # Load Balancer handlers
 # ---------------------------------------------------------------------------
 
+# InterfaceType of the network interfaces a load balancer of each type gets (AWS capture).
+_LB_INTERFACE_TYPES = {"network": "network_load_balancer", "application": "interface"}
+
+
 def _create_lb(params):
     name = _p(params, "Name")
     if not name:
@@ -970,6 +974,11 @@ def _create_lb(params):
         lb["IpamPools"] = ipam_pools
     _lbs[arn] = lb
     _tags[arn] = _parse_tags(params)
+    eni_type = _LB_INTERFACE_TYPES.get(lb_type)
+    if eni_type:
+        from ministack.services import ec2
+        ec2.create_load_balancer_interfaces(
+            f"ELB {prefix}/{name}/{lid}", eni_type, lb["Subnets"], lb["SecurityGroups"])
     _lb_attrs[arn] = [
         {"Key": "access_logs.s3.enabled", "Value": "false"},
         {"Key": "deletion_protection.enabled", "Value": "false"},
@@ -1007,7 +1016,9 @@ def _describe_lbs(params):
 
 def _delete_lb(params):
     arn = _p(params, "LoadBalancerArn")
-    _lbs.pop(arn, None)
+    if _lbs.pop(arn, None):
+        from ministack.services import ec2
+        ec2.delete_load_balancer_interfaces("ELB " + arn.split(":loadbalancer/", 1)[1])
     _lb_attrs.pop(arn, None)
     _tags.pop(arn, None)
     return _empty("DeleteLoadBalancer")
