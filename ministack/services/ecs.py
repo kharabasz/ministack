@@ -1815,10 +1815,14 @@ def _container_override_for(container_overrides, container_name):
 
 def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
                       host_mode, task_id, task_arn, ministack_net_ip,
-                      cluster_arn):
+                      cluster_arn, network_container=None):
     """Build kwargs for docker_client.containers.run from a container
     definition + task definition (privileged, cap_add, pid_mode, networking,
     bind mounts).
+
+    `network_container` is the id of the awsvpc task's first container: the
+    task has one network interface, so its other containers join that one's
+    network (AWS capture: every container of a task names the same address).
     """
     lp = cdef.get("linuxParameters") or cdef.get("LinuxParameters") or {}
     caps = lp.get("Capabilities") or lp.get("capabilities") or {}
@@ -1862,6 +1866,8 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
         kwargs["pid_mode"] = "host"
     if host_mode:
         kwargs["network_mode"] = "host"
+    elif network_container:
+        kwargs["network_mode"] = f"container:{network_container}"
     else:
         kwargs["network"] = ecs_network
         if not ministack_net_ip:
@@ -2549,6 +2555,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
     except Exception:
         logger.debug("ECS: could not detect Ministack network, using default")
 
+    network_container = None
     for i, cdef in enumerate(td.get("containerDefinitions", [])):
         with resource_lock("ecs-task", task_arn):
             active = _task_is_active(task_arn, task)
@@ -2604,6 +2611,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
         run_kwargs = _build_run_kwargs(
             effective_cdef, td, env, port_bindings, ecs_network,
             host_mode, task_id, task_arn, ministack_net_ip, cluster_arn,
+            network_container,
         )
 
         with resource_lock("ecs-task", task_arn):
@@ -2628,6 +2636,8 @@ def _start_task_worker(task, td, container_overrides, docker_client):
             _cleanup_task_resources(task, docker_client, container)
             return
         _start_awslogs_forwarder(container, effective_cdef, task_id)
+        if td.get("networkMode") == "awsvpc" and not network_container:
+            network_container = container.id
 
     if not _mark_task_running(task_arn, task):
         _cleanup_task_resources(task, docker_client)

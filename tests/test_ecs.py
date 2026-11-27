@@ -4799,3 +4799,36 @@ def test_pinned_platform_pull_failure_says_the_pull_failed(caplog):
         ecs_service._run_docker_container(daemon, cdef, {"platform": "linux/arm64"})
     assert "pulling quay.io/permitio/pdp-v2:0.9.9 for linux/arm64 failed" in caplog.text
     assert "this host cannot run it" not in caplog.text
+
+
+@pytest.mark.data_plane
+def test_ecs_awsvpc_task_containers_share_the_network_interface(ecs):
+    """The containers of an awsvpc task share one network interface, so one reaches another's port over
+    localhost and both answer on the task's address (AWS capture)."""
+    cluster = f"shared-eni-{_uuid_mod.uuid4().hex[:8]}"
+    family = f"shared-eni-{_uuid_mod.uuid4().hex[:8]}"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family=family, networkMode="awsvpc", requiresCompatibilities=["FARGATE"], cpu="256", memory="512",
+        containerDefinitions=[
+            {"name": "server", "image": "busybox", "essential": False,
+             "command": ["sh", "-c", "mkdir /www && echo ok > /www/index.html && httpd -f -p 8000 -h /www"]},
+            {"name": "client", "image": "busybox", "essential": True,
+             "command": ["sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10; do "
+                                     "wget -q -O- http://127.0.0.1:8000/ && exit 0; sleep 1; done; exit 7"]},
+        ])
+    task_arn = ecs.run_task(
+        cluster=cluster, taskDefinition=family, launchType="FARGATE",
+        networkConfiguration={"awsvpcConfiguration": {"subnets": ["subnet-00000001"]}})["tasks"][0]["taskArn"]
+    try:
+        for _ in range(60):
+            task = ecs.describe_tasks(cluster=cluster, tasks=[task_arn])["tasks"][0]
+            if task["lastStatus"] == "STOPPED":
+                break
+            time.sleep(1)
+        assert task["lastStatus"] == "STOPPED"
+        client = next(c for c in task["containers"] if c["name"] == "client")
+        assert client["exitCode"] == 0
+    finally:
+        ecs.deregister_task_definition(taskDefinition=f"{family}:1")
+        ecs.delete_cluster(cluster=cluster)
