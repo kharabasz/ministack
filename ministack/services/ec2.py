@@ -3734,12 +3734,57 @@ def _delete_network_interface(p):
 
 def _describe_network_interfaces(p):
     filter_ids = _parse_member_list(p, "NetworkInterfaceId")
+    filters = _parse_filters(p)
     enis = [eni for eni in _network_interfaces.values()
-            if not filter_ids or eni["NetworkInterfaceId"] in filter_ids]
+            if (not filter_ids or eni["NetworkInterfaceId"] in filter_ids)
+            and _matches_eni_filters(eni, filters)]
     enis, next_xml = (enis, "") if filter_ids else _page(p, enis, (5, 1000))
     items = "".join(_eni_fields_xml(eni) for eni in enis)
     return _xml(200, "DescribeNetworkInterfacesResponse",
                 f"<networkInterfaceSet>{items}</networkInterfaceSet>{next_xml}")
+
+
+def _matches_eni_filters(eni, filters):
+    for name, vals in filters.items():
+        if name == "description":
+            if not _filter_value_matches(eni["Description"], vals):
+                return False
+        elif name == "subnet-id":
+            if eni["SubnetId"] not in vals:
+                return False
+    return True
+
+
+def create_load_balancer_interfaces(description, interface_type, subnet_ids, sg_ids):
+    """The interfaces Elastic Load Balancing keeps for a load balancer: one per subnet, in use, with an
+    address in the subnet and the load balancer's security groups (AWS capture). Called by alb."""
+    for subnet_id in subnet_ids:
+        subnet = _subnets.get(subnet_id, {})
+        net = ipaddress.ip_network(subnet.get("CidrBlock", "10.0.0.0/16"), strict=False)
+        eni_id = "eni-" + "".join(random.choices(string.hexdigits[:16], k=17))
+        _network_interfaces[eni_id] = {
+            "NetworkInterfaceId": eni_id,
+            "SubnetId": subnet_id,
+            "VpcId": subnet.get("VpcId", _DEFAULT_VPC_ID),
+            "AvailabilityZone": subnet.get("AvailabilityZone", f"{get_region()}a"),
+            "Description": description,
+            "OwnerId": get_account_id(),
+            "Status": "in-use",
+            "PrivateIpAddress": str(net.network_address + random.randint(4, max(4, net.num_addresses - 2))),
+            "InterfaceType": interface_type,
+            "SourceDestCheck": interface_type != "network_load_balancer",
+            "MacAddress": ":".join(f"{random.randint(0,255):02x}" for _ in range(6)),
+            "Groups": [
+                {"GroupId": sg, "GroupName": _security_groups.get(sg, {}).get("GroupName", sg)}
+                for sg in sg_ids
+            ],
+            "Attachment": None,
+        }
+
+
+def delete_load_balancer_interfaces(description):
+    for eni_id in [k for k, eni in _network_interfaces.items() if eni["Description"] == description]:
+        del _network_interfaces[eni_id]
 
 
 def _attach_network_interface(p):

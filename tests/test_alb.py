@@ -3830,3 +3830,26 @@ def test_elbv2_xml_special_characters_are_escaped(elbv2):
     finally:
         elbv2.delete_listener(ListenerArn=l_arn)
         elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+def test_elbv2_load_balancer_network_interfaces(elbv2, ec2):
+    """A load balancer keeps one network interface per subnet, found by description and subnet (AWS capture)."""
+    vpc = ec2.create_vpc(CidrBlock="10.77.0.0/16")["Vpc"]["VpcId"]
+    subnets = [ec2.create_subnet(VpcId=vpc, CidrBlock=f"10.77.{i}.0/24")["Subnet"]["SubnetId"] for i in range(2)]
+    lb_arn = elbv2.create_load_balancer(
+        Name="eni-nlb", Type="network", Scheme="internal", Subnets=subnets)["LoadBalancers"][0]["LoadBalancerArn"]
+    by_description = {"Name": "description", "Values": ["ELB " + lb_arn.split(":loadbalancer/")[1]]}
+    try:
+        for i, subnet in enumerate(subnets):
+            (eni,) = ec2.describe_network_interfaces(
+                Filters=[by_description, {"Name": "subnet-id", "Values": [subnet]}])["NetworkInterfaces"]
+            assert eni["SubnetId"] == subnet
+            assert eni["InterfaceType"] == "network_load_balancer"
+            assert eni["Status"] == "in-use"
+            assert eni["PrivateIpAddress"].startswith(f"10.77.{i}.")
+    finally:
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+        assert ec2.describe_network_interfaces(Filters=[by_description])["NetworkInterfaces"] == []
+        for subnet in subnets:
+            ec2.delete_subnet(SubnetId=subnet)
+        ec2.delete_vpc(VpcId=vpc)
