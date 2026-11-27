@@ -1750,7 +1750,10 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
         host = "host.docker.internal"
     port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
     env["ECS_CONTAINER_METADATA_URI_V4"] = f"http://{host}:{port}/v4/{token}"
-    credentials_path = f"/v2/credentials/{new_uuid()}"
+    credentials_id = new_uuid()
+    credentials_path = f"/v2/credentials/{credentials_id}"
+    if td.get("taskRoleArn"):
+        ecs_metadata.register_task_role(credentials_id, token, td["taskRoleArn"], task_arn)
     env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = f"http://{host}:{port}{credentials_path}"
     if credentials_address:
         env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] = credentials_path

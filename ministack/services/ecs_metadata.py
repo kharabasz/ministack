@@ -22,6 +22,8 @@ _TASKS: dict[str, dict] = {}
 _TOKEN_TO_TASK: dict[str, str] = {}
 # token -> container_payload (an entry inside _TASKS[arn]["Containers"])
 _TOKEN_TO_CONTAINER: dict[str, dict] = {}
+# credentials id -> (token, task role ARN, task ARN): the role /v2/credentials/<id> vends
+_CREDENTIAL_ROLES: dict[str, tuple[str, str, str]] = {}
 _LOCK = threading.Lock()
 
 _PATH_RE = re.compile(r"^/v4/(?P<token>[A-Za-z0-9_-]{8,})(?P<rest>/.*)?$")
@@ -50,8 +52,23 @@ def register_container(
     )
 
 
+def register_task_role(credentials_id: str, token: str, role_arn: str, task_arn: str) -> None:
+    """Record the task role behind a container's credentials path."""
+    with _LOCK:
+        _CREDENTIAL_ROLES[credentials_id] = (token, role_arn, task_arn)
+
+
+def task_role(credentials_id: str):
+    """(task role ARN, task ARN) for a registered credentials path, or None."""
+    with _LOCK:
+        entry = _CREDENTIAL_ROLES.get(credentials_id)
+    return entry[1:] if entry else None
+
+
 def unregister_token(token: str) -> None:
     with _LOCK:
+        for credentials_id in [k for k, v in _CREDENTIAL_ROLES.items() if v[0] == token]:
+            del _CREDENTIAL_ROLES[credentials_id]
         arn = _TOKEN_TO_TASK.pop(token, None)
         container = _TOKEN_TO_CONTAINER.pop(token, None)
         if not arn:
@@ -115,6 +132,7 @@ def reset() -> None:
         _TASKS.clear()
         _TOKEN_TO_TASK.clear()
         _TOKEN_TO_CONTAINER.clear()
+        _CREDENTIAL_ROLES.clear()
 
 
 async def handle_request(method, path, headers, body, query_params):

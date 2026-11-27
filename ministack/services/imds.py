@@ -109,21 +109,39 @@ def _credentials_doc() -> dict:
     }
 
 
-def _ecs_task_credentials_doc() -> dict:
+def _ecs_task_credentials_doc(role_arn=None, task_arn=None) -> dict:
     """ECS task IAM role credentials document shape (`/v2/credentials/<uuid>`).
 
     Strict per AWS docs: AccessKeyId, SecretAccessKey, Token, Expiration, RoleArn.
     No Code / Type / LastUpdated — those are EC2 IMDS-only and confuse strict
     consumers that distinguish the two endpoints (e.g. some Go SDK behaviour
     around iam.RoleName extraction).
+
+    With the task's role the credentials are a session of that role, named after
+    the task, in the role's account: what the task then calls is called as its role.
     """
-    return {
+    doc = {
         "AccessKeyId": _gen_session_access_key(),
         "SecretAccessKey": _gen_secret(),
         "Token": _gen_session_token(),
         "Expiration": _future(3600),
-        "RoleArn": f"arn:aws:iam::{get_account_id()}:role/ministack-ecs-task-role",
+        "RoleArn": role_arn or f"arn:aws:iam::{get_account_id()}:role/ministack-ecs-task-role",
     }
+    if role_arn:
+        from ministack.services import sts
+
+        account_id = role_arn.split(":")[4]
+        session_name = task_arn.rsplit("/", 1)[-1]
+        sts.register_session(doc["AccessKeyId"], {
+            "Arn": f"arn:aws:sts::{account_id}:assumed-role/{role_arn.rsplit('/', 1)[-1]}/{session_name}",
+            "UserId": f"{sts._role_id(role_arn)}:{session_name}",
+            "SecretAccessKey": doc["SecretAccessKey"],
+            "SessionToken": doc["Token"],
+            "Expiration": time.time() + 3600,
+            "AccountId": account_id,
+            "PrincipalType": "AssumedRole",
+        })
+    return doc
 
 
 def _identity_document() -> dict:
@@ -167,7 +185,9 @@ async def handle_request(method, path, headers, body, query_params):
     if path.startswith("/v2/credentials/"):
         if method != "GET":
             return _text("Method Not Allowed", 405)
-        return _json_resp(_ecs_task_credentials_doc())
+        from ministack.services import ecs_metadata
+
+        return _json_resp(_ecs_task_credentials_doc(*(ecs_metadata.task_role(path.rsplit("/", 1)[-1]) or ())))
 
     if path.startswith("/latest/api/token"):
         if method != "PUT":

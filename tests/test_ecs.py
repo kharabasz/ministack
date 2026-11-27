@@ -4885,3 +4885,47 @@ def test_ecs_container_runs_the_task_definitions_entry_point(ecs):
     finally:
         ecs.deregister_task_definition(taskDefinition=f"{family}:1")
         ecs.delete_cluster(cluster=cluster)
+
+
+@pytest.mark.data_plane
+def test_ecs_task_credentials_are_its_task_roles(ecs, logs, iam):
+    """The credentials a task reads name its task role, and calls made with them are made as a session
+    of that role named after the task (AWS documentation: `RoleArn` is the task role)."""
+    import boto3
+    from conftest import ENDPOINT
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    cluster, family, group = f"task-role-{suffix}", f"task-role-{suffix}", f"/ecs/task-role-{suffix}"
+    role_arn = iam.create_role(RoleName=f"task-role-{suffix}", AssumeRolePolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+                                                "Action": "sts:AssumeRole"}]}))["Role"]["Arn"]
+    logs.create_log_group(logGroupName=group)
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(family=family, taskRoleArn=role_arn, containerDefinitions=[{
+        "name": "app", "image": "busybox", "essential": True, "memory": 64,
+        "command": ["sh", "-c", 'wget -q -O- "$AWS_CONTAINER_CREDENTIALS_FULL_URI"'],
+        "logConfiguration": {"logDriver": "awslogs", "options": {
+            "awslogs-group": group, "awslogs-region": "us-east-1", "awslogs-stream-prefix": "ecs"}}}])
+    task_id = ecs.run_task(cluster=cluster, taskDefinition=family)["tasks"][0]["taskArn"].rsplit("/", 1)[-1]
+    found = []
+
+    def credentials_logged():
+        if logs.describe_log_streams(logGroupName=group, logStreamNamePrefix=f"ecs/app/{task_id}")["logStreams"]:
+            for event in logs.get_log_events(logGroupName=group, logStreamName=f"ecs/app/{task_id}")["events"]:
+                if "RoleArn" in event["message"]:
+                    found.append(json.loads(event["message"]))
+        return bool(found)
+
+    try:
+        _wait_until(credentials_logged, timeout=30)
+        doc = found[0]
+        assert doc["RoleArn"] == role_arn
+        caller = boto3.client(
+            "sts", endpoint_url=ENDPOINT, region_name="us-east-1", aws_access_key_id=doc["AccessKeyId"],
+            aws_secret_access_key=doc["SecretAccessKey"], aws_session_token=doc["Token"]).get_caller_identity()
+        assert caller["Arn"] == f"arn:aws:sts::{role_arn.split(':')[4]}:assumed-role/task-role-{suffix}/{task_id}"
+    finally:
+        ecs.deregister_task_definition(taskDefinition=f"{family}:1")
+        ecs.delete_cluster(cluster=cluster)
+        logs.delete_log_group(logGroupName=group)
+        iam.delete_role(RoleName=f"task-role-{suffix}")
